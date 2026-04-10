@@ -1,0 +1,662 @@
+import React, { useMemo, useState } from 'react';
+import * as XLSX from 'xlsx';
+import { Upload, Download, AlertTriangle, CheckCircle2, FileSpreadsheet, Database, Filter, RefreshCcw } from 'lucide-react';
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Badge } from '@/components/ui/badge';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { ScrollArea } from '@/components/ui/scroll-area';
+
+const REQUIRED_SHEETS = ['전전년재고_DB', '전년재고_DB', '사용'];
+const ITEM_GROUPS = ['의류', '잡화', '생활', '문화', '건강미용', '식품', '기증파트너'];
+
+function asNum(v) {
+  if (v === null || v === undefined || v === '') return 0;
+  if (typeof v === 'number') return Number.isFinite(v) ? v : 0;
+  if (typeof v === 'string') {
+    const cleaned = v.replace(/,/g, '').trim();
+    if (!cleaned) return 0;
+    const n = Number(cleaned);
+    return Number.isFinite(n) ? n : 0;
+  }
+  return 0;
+}
+
+function roundWon(v) {
+  return Math.round((v + Number.EPSILON) * 100) / 100;
+}
+
+function fmt(v) {
+  return new Intl.NumberFormat('ko-KR').format(Math.round(v || 0));
+}
+
+function excelDateToText(v) {
+  if (v instanceof Date) return v.toISOString().slice(0, 10);
+  if (typeof v === 'number' && v > 20000) {
+    const d = XLSX.SSF.parse_date_code(v);
+    if (!d) return String(v);
+    return `${d.y}-${String(d.m).padStart(2, '0')}-${String(d.d).padStart(2, '0')}`;
+  }
+  return v ? String(v).slice(0, 10) : '';
+}
+
+function getSheetRows(workbook, name) {
+  const ws = workbook.Sheets[name];
+  if (!ws) return [];
+  return XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: null });
+}
+
+function inferSelectedStore(workbook) {
+  const rows = getSheetRows(workbook, '설정');
+  return rows?.[1]?.[1] ? String(rows[1][1]) : '';
+}
+
+function parseInventoryRows(rows, type) {
+  return rows.slice(1)
+    .filter(r => r && (r[0] || r[1]))
+    .map((r, idx) => ({
+      rowNo: idx + 2,
+      store: r[0] ? String(r[0]).trim() : '',
+      itemGroup: r[1] ? String(r[1]).trim() : '',
+      date: excelDateToText(r[2]),
+      qty: asNum(r[3]),
+      amt: asNum(r[4]),
+      sourceType: type,
+    }))
+    .filter(r => r.store && r.itemGroup);
+}
+
+function parseUsageRows(rows) {
+  return rows.slice(1)
+    .map((r, idx) => ({
+      rowNo: idx + 2,
+      date: excelDateToText(r[0]),
+      itemGroup: r[1] ? String(r[1]).trim() : '',
+      saleQty: asNum(r[2]),
+      saleAmt: asNum(r[3]),
+      discardQty: asNum(r[4]),
+      discardAmt: asNum(r[5]),
+      totalQty: asNum(r[6]),
+      totalAmt: asNum(r[7]),
+    }))
+    .filter(r => r.date || r.itemGroup || r.saleQty || r.saleAmt || r.discardQty || r.discardAmt || r.totalQty || r.totalAmt);
+}
+
+function buildOpeningInventory(prev2Rows, prev1Rows, store) {
+  const seed = {};
+  [...ITEM_GROUPS, ...prev2Rows.map(r => r.itemGroup), ...prev1Rows.map(r => r.itemGroup)].forEach(group => {
+    if (!group) return;
+    seed[group] = {
+      itemGroup: group,
+      yyQty: 0,
+      yyAmt: 0,
+      yQty: 0,
+      yAmt: 0,
+    };
+  });
+
+  prev2Rows.filter(r => r.store === store).forEach(r => {
+    if (!seed[r.itemGroup]) seed[r.itemGroup] = { itemGroup: r.itemGroup, yyQty: 0, yyAmt: 0, yQty: 0, yAmt: 0 };
+    seed[r.itemGroup].yyQty += r.qty;
+    seed[r.itemGroup].yyAmt += r.amt;
+  });
+  prev1Rows.filter(r => r.store === store).forEach(r => {
+    if (!seed[r.itemGroup]) seed[r.itemGroup] = { itemGroup: r.itemGroup, yyQty: 0, yyAmt: 0, yQty: 0, yAmt: 0 };
+    seed[r.itemGroup].yQty += r.qty;
+    seed[r.itemGroup].yAmt += r.amt;
+  });
+
+  return seed;
+}
+
+function allocateFromLayer(layer, reqQty, reqAmt) {
+  if (reqQty <= 0 || reqAmt <= 0) return { qty: 0, amt: 0 };
+  if (layer.qty <= 0 || layer.amt <= 0) return { qty: 0, amt: 0 };
+  const unit = layer.amt / layer.qty;
+  if (!Number.isFinite(unit) || unit <= 0) return { qty: 0, amt: 0 };
+
+  const maxByAmt = Math.floor(reqAmt / unit + 1e-9);
+  const qty = Math.max(0, Math.min(layer.qty, reqQty, maxByAmt));
+  if (qty <= 0) return { qty: 0, amt: 0 };
+
+  let amt = roundWon(qty * unit);
+  amt = Math.min(amt, layer.amt, reqAmt);
+
+  layer.qty = roundWon(layer.qty - qty);
+  layer.amt = roundWon(layer.amt - amt);
+  return { qty, amt: roundWon(amt) };
+}
+
+function allocateComponent(reqQty, reqAmt, layers) {
+  const out = {
+    yyQty: 0, yyAmt: 0,
+    yQty: 0, yAmt: 0,
+    currentQty: 0, currentAmt: 0,
+    shortageQty: 0, shortageAmt: 0,
+    flags: [],
+  };
+
+  if ((reqQty === 0 && reqAmt > 0) || (reqQty > 0 && reqAmt === 0)) {
+    out.shortageQty = reqQty;
+    out.shortageAmt = reqAmt;
+    out.flags.push('수량/금액 불일치');
+    return out;
+  }
+  if (reqQty === 0 && reqAmt === 0) return out;
+
+  const yyAlloc = allocateFromLayer(layers.yy, reqQty, reqAmt);
+  out.yyQty += yyAlloc.qty; out.yyAmt += yyAlloc.amt;
+  let remQty = roundWon(reqQty - yyAlloc.qty);
+  let remAmt = roundWon(reqAmt - yyAlloc.amt);
+
+  const yAlloc = allocateFromLayer(layers.y, remQty, remAmt);
+  out.yQty += yAlloc.qty; out.yAmt += yAlloc.amt;
+  remQty = roundWon(remQty - yAlloc.qty);
+  remAmt = roundWon(remAmt - yAlloc.amt);
+
+  if (remQty > 0 && remAmt > 0) {
+    out.currentQty = remQty;
+    out.currentAmt = remAmt;
+  } else if (remQty > 0 || remAmt > 0) {
+    out.shortageQty = Math.max(0, remQty);
+    out.shortageAmt = Math.max(0, remAmt);
+    out.flags.push('당해 잔여 수량/금액 불일치');
+  }
+
+  return out;
+}
+
+function processWorkbookData(prev2Rows, prev1Rows, usageRows, store) {
+  const opening = buildOpeningInventory(prev2Rows, prev1Rows, store);
+  const runtimeLayers = {};
+  Object.keys(opening).forEach(k => {
+    runtimeLayers[k] = {
+      yy: { qty: opening[k].yyQty, amt: opening[k].yyAmt },
+      y: { qty: opening[k].yQty, amt: opening[k].yAmt },
+    };
+  });
+
+  const resultRows = [];
+  const anomalies = [];
+
+  usageRows.forEach(r => {
+    if (!r.itemGroup) return;
+    if (!runtimeLayers[r.itemGroup]) runtimeLayers[r.itemGroup] = { yy: { qty: 0, amt: 0 }, y: { qty: 0, amt: 0 } };
+    const layers = runtimeLayers[r.itemGroup];
+
+    const rowFlags = [];
+    if ((r.saleQty === 0 && r.saleAmt > 0) || (r.saleQty > 0 && r.saleAmt === 0)) rowFlags.push('판매 수량/금액 불일치');
+    if ((r.discardQty === 0 && r.discardAmt > 0) || (r.discardQty > 0 && r.discardAmt === 0)) rowFlags.push('폐기 수량/금액 불일치');
+    if ((r.totalQty === 0 && r.totalAmt > 0) || (r.totalQty > 0 && r.totalAmt === 0)) rowFlags.push('총사용 수량/금액 불일치');
+    if (roundWon(r.saleQty + r.discardQty) !== roundWon(r.totalQty)) rowFlags.push('총사용수량 != 판매+폐기');
+    if (roundWon(r.saleAmt + r.discardAmt) !== roundWon(r.totalAmt)) rowFlags.push('총사용금액 != 판매+폐기');
+
+    const saleAlloc = allocateComponent(r.saleQty, r.saleAmt, layers);
+    const discardAlloc = allocateComponent(r.discardQty, r.discardAmt, layers);
+
+    const out = {
+      date: r.date,
+      itemGroup: r.itemGroup,
+      saleQty: r.saleQty,
+      saleAmt: r.saleAmt,
+      discardQty: r.discardQty,
+      discardAmt: r.discardAmt,
+      totalQty: r.totalQty,
+      totalAmt: r.totalAmt,
+      yySaleQty: saleAlloc.yyQty,
+      yySaleAmt: saleAlloc.yyAmt,
+      yyDiscardQty: discardAlloc.yyQty,
+      yyDiscardAmt: discardAlloc.yyAmt,
+      ySaleQty: saleAlloc.yQty,
+      ySaleAmt: saleAlloc.yAmt,
+      yDiscardQty: discardAlloc.yQty,
+      yDiscardAmt: discardAlloc.yAmt,
+      currentSaleQty: saleAlloc.currentQty,
+      currentSaleAmt: saleAlloc.currentAmt,
+      currentDiscardQty: discardAlloc.currentQty,
+      currentDiscardAmt: discardAlloc.currentAmt,
+      shortageQty: roundWon(saleAlloc.shortageQty + discardAlloc.shortageQty),
+      shortageAmt: roundWon(saleAlloc.shortageAmt + discardAlloc.shortageAmt),
+      rowFlags: [...rowFlags, ...saleAlloc.flags, ...discardAlloc.flags],
+    };
+
+    const allocQtySum = roundWon(out.yySaleQty + out.yyDiscardQty + out.ySaleQty + out.yDiscardQty + out.currentSaleQty + out.currentDiscardQty);
+    const allocAmtSum = roundWon(out.yySaleAmt + out.yyDiscardAmt + out.ySaleAmt + out.yDiscardAmt + out.currentSaleAmt + out.currentDiscardAmt);
+    if (allocQtySum !== roundWon(out.totalQty - out.shortageQty)) out.rowFlags.push('배분수량 합계 검증 필요');
+    if (allocAmtSum !== roundWon(out.totalAmt - out.shortageAmt)) out.rowFlags.push('배분금액 합계 검증 필요');
+
+    if (out.rowFlags.length || out.shortageQty || out.shortageAmt) {
+      anomalies.push({
+        date: out.date,
+        itemGroup: out.itemGroup,
+        shortageQty: out.shortageQty,
+        shortageAmt: out.shortageAmt,
+        flags: [...new Set(out.rowFlags)].join(', '),
+      });
+    }
+    resultRows.push(out);
+  });
+
+  const summary = Object.keys(buildOpeningInventory(prev2Rows, prev1Rows, store)).sort().map(group => {
+    const openingRow = opening[group] || { yyQty: 0, yyAmt: 0, yQty: 0, yAmt: 0 };
+    const rows = resultRows.filter(r => r.itemGroup === group);
+
+    const yySaleQty = rows.reduce((s, r) => s + r.yySaleQty, 0);
+    const yySaleAmt = rows.reduce((s, r) => s + r.yySaleAmt, 0);
+    const yyDiscardQty = rows.reduce((s, r) => s + r.yyDiscardQty, 0);
+    const yyDiscardAmt = rows.reduce((s, r) => s + r.yyDiscardAmt, 0);
+    const yyUsedQty = yySaleQty + yyDiscardQty;
+    const yyUsedAmt = yySaleAmt + yyDiscardAmt;
+
+    const ySaleQty = rows.reduce((s, r) => s + r.ySaleQty, 0);
+    const ySaleAmt = rows.reduce((s, r) => s + r.ySaleAmt, 0);
+    const yDiscardQty = rows.reduce((s, r) => s + r.yDiscardQty, 0);
+    const yDiscardAmt = rows.reduce((s, r) => s + r.yDiscardAmt, 0);
+    const yUsedQty = ySaleQty + yDiscardQty;
+    const yUsedAmt = ySaleAmt + yDiscardAmt;
+
+    const currentSaleQty = rows.reduce((s, r) => s + r.currentSaleQty, 0);
+    const currentSaleAmt = rows.reduce((s, r) => s + r.currentSaleAmt, 0);
+    const currentDiscardQty = rows.reduce((s, r) => s + r.currentDiscardQty, 0);
+    const currentDiscardAmt = rows.reduce((s, r) => s + r.currentDiscardAmt, 0);
+    const currentUsedQty = currentSaleQty + currentDiscardQty;
+    const currentUsedAmt = currentSaleAmt + currentDiscardAmt;
+
+    const shortageQty = rows.reduce((s, r) => s + r.shortageQty, 0);
+    const shortageAmt = rows.reduce((s, r) => s + r.shortageAmt, 0);
+
+    const yyDiffQty = roundWon(yyUsedQty - openingRow.yyQty);
+    const yyDiffAmt = roundWon(yyUsedAmt - openingRow.yyAmt);
+    const yDiffQty = roundWon(yUsedQty - openingRow.yQty);
+    const yDiffAmt = roundWon(yUsedAmt - openingRow.yAmt);
+
+    return {
+      itemGroup: group,
+      yyOpenQty: openingRow.yyQty,
+      yyOpenAmt: openingRow.yyAmt,
+      yySaleQty,
+      yySaleAmt,
+      yyDiscardQty,
+      yyDiscardAmt,
+      yyUsedQty,
+      yyUsedAmt,
+      yyDiffQty,
+      yyDiffAmt,
+      yOpenQty: openingRow.yQty,
+      yOpenAmt: openingRow.yAmt,
+      ySaleQty,
+      ySaleAmt,
+      yDiscardQty,
+      yDiscardAmt,
+      yUsedQty,
+      yUsedAmt,
+      yDiffQty,
+      yDiffAmt,
+      currentSaleQty,
+      currentSaleAmt,
+      currentDiscardQty,
+      currentDiscardAmt,
+      currentUsedQty,
+      currentUsedAmt,
+      shortageQty,
+      shortageAmt,
+      ok: yyDiffQty <= 0 && yyDiffAmt <= 0 && yDiffQty <= 0 && yDiffAmt <= 0,
+    };
+  });
+
+  const kpis = {
+    totalRows: resultRows.length,
+    anomalyRows: anomalies.length,
+    shortageQty: summary.reduce((s, r) => s + r.shortageQty, 0),
+    shortageAmt: summary.reduce((s, r) => s + r.shortageAmt, 0),
+    yyOveruse: summary.filter(r => r.yyDiffQty > 0 || r.yyDiffAmt > 0).length,
+    yOveruse: summary.filter(r => r.yDiffQty > 0 || r.yDiffAmt > 0).length,
+  };
+
+  return { resultRows, summary, anomalies, kpis, opening };
+}
+
+function exportResults(store, processed) {
+  const wb = XLSX.utils.book_new();
+
+  const detailRows = [
+    ['일자','품목군','판매수량','판매금액','폐기수량','폐기금액','총사용수량','총사용금액','전전년_판매수량','전전년_판매금액','전전년_폐기수량','전전년_폐기금액','전년_판매수량','전년_판매금액','전년_폐기수량','전년_폐기금액','당해_판매수량','당해_판매금액','당해_폐기수량','당해_폐기금액','부족수량','부족금액','검증메모'],
+    ...processed.resultRows.map(r => [
+      r.date, r.itemGroup, r.saleQty, r.saleAmt, r.discardQty, r.discardAmt, r.totalQty, r.totalAmt,
+      r.yySaleQty, r.yySaleAmt, r.yyDiscardQty, r.yyDiscardAmt,
+      r.ySaleQty, r.ySaleAmt, r.yDiscardQty, r.yDiscardAmt,
+      r.currentSaleQty, r.currentSaleAmt, r.currentDiscardQty, r.currentDiscardAmt,
+      r.shortageQty, r.shortageAmt, [...new Set(r.rowFlags)].join(', ')
+    ])
+  ];
+
+  const summaryRows = [
+    ['품목군','전전년재고수량','전전년재고금액','전전년_판매수량','전전년_판매금액','전전년_폐기수량','전전년_폐기금액','전전년 사용수량','전전년 사용금액','전전년 차이수량','전전년 차이금액','전년재고수량','전년재고금액','전년_판매수량','전년_판매금액','전년_폐기수량','전년_폐기금액','전년 사용수량','전년 사용금액','전년 차이수량','전년 차이금액','당해_판매수량','당해_판매금액','당해_폐기수량','당해_폐기금액','당해 사용수량','당해 사용금액','부족수량','부족금액','판정'],
+    ...processed.summary.map(r => [
+      r.itemGroup, r.yyOpenQty, r.yyOpenAmt, r.yySaleQty, r.yySaleAmt, r.yyDiscardQty, r.yyDiscardAmt, r.yyUsedQty, r.yyUsedAmt, r.yyDiffQty, r.yyDiffAmt,
+      r.yOpenQty, r.yOpenAmt, r.ySaleQty, r.ySaleAmt, r.yDiscardQty, r.yDiscardAmt, r.yUsedQty, r.yUsedAmt, r.yDiffQty, r.yDiffAmt,
+      r.currentSaleQty, r.currentSaleAmt, r.currentDiscardQty, r.currentDiscardAmt, r.currentUsedQty, r.currentUsedAmt, r.shortageQty, r.shortageAmt, r.ok ? '정상' : '검토필요'
+    ])
+  ];
+
+  const anomalyRows = [
+    ['일자','품목군','부족수량','부족금액','이상치'],
+    ...processed.anomalies.map(r => [r.date, r.itemGroup, r.shortageQty, r.shortageAmt, r.flags])
+  ];
+
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(detailRows), '사용_정리');
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(summaryRows), '검증_요약');
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(anomalyRows), '부족_이상치');
+
+  XLSX.writeFile(wb, `${store || '지점'}_FIFO_자동소진_결과.xlsx`);
+}
+
+export default function FIFOInventoryWebTool() {
+  const [fileName, setFileName] = useState('');
+  const [parsed, setParsed] = useState(null);
+  const [selectedStore, setSelectedStore] = useState('');
+
+  const stores = useMemo(() => {
+    if (!parsed) return [];
+    const set = new Set([
+      ...parsed.prev2Rows.map(r => r.store),
+      ...parsed.prev1Rows.map(r => r.store),
+    ].filter(Boolean));
+    return Array.from(set).sort((a, b) => a.localeCompare(b, 'ko'));
+  }, [parsed]);
+
+  const processed = useMemo(() => {
+    if (!parsed || !selectedStore) return null;
+    return processWorkbookData(parsed.prev2Rows, parsed.prev1Rows, parsed.usageRows, selectedStore);
+  }, [parsed, selectedStore]);
+
+  const onUpload = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const data = await file.arrayBuffer();
+    const wb = XLSX.read(data, { type: 'array', cellDates: true, cellFormula: false, cellNF: true, cellText: false });
+
+    const missing = REQUIRED_SHEETS.filter(name => !wb.Sheets[name]);
+    if (missing.length) {
+      alert(`필수 시트가 없습니다: ${missing.join(', ')}`);
+      return;
+    }
+
+    const prev2Rows = parseInventoryRows(getSheetRows(wb, '전전년재고_DB'), '전전년');
+    const prev1Rows = parseInventoryRows(getSheetRows(wb, '전년재고_DB'), '전년');
+    const usageRows = parseUsageRows(getSheetRows(wb, '사용'));
+    const inferredStore = inferSelectedStore(wb);
+
+    setParsed({ prev2Rows, prev1Rows, usageRows });
+    setSelectedStore(inferredStore || [...new Set([...prev2Rows.map(r => r.store), ...prev1Rows.map(r => r.store)])][0] || '');
+    setFileName(file.name);
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-50 p-6">
+      <div className="mx-auto max-w-7xl space-y-6">
+        <div className="grid gap-6 lg:grid-cols-[1.2fr_0.8fr]">
+          <Card className="rounded-3xl shadow-sm">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2 text-2xl">
+                <Database className="h-6 w-6" />
+                사용명세서 자동소진 웹도구
+              </CardTitle>
+              <CardDescription>
+                보내주신 엑셀 구조를 기준으로 전전년/전년/당해 FIFO를 강제하고, 부족수량·부족금액·이상치를 따로 보여주는 버전입니다.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="grid gap-4 md:grid-cols-[1fr_auto] md:items-end">
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">원본 엑셀 업로드</label>
+                  <Input type="file" accept=".xlsx,.xls" onChange={onUpload} />
+                </div>
+                <div className="flex items-center gap-2 rounded-2xl bg-slate-100 px-4 py-3 text-sm text-slate-600">
+                  <FileSpreadsheet className="h-4 w-4" />
+                  {fileName || '아직 파일 없음'}
+                </div>
+              </div>
+
+              <div className="grid gap-4 md:grid-cols-3">
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">지점 선택</label>
+                  <Select value={selectedStore} onValueChange={setSelectedStore} disabled={!stores.length}>
+                    <SelectTrigger className="rounded-2xl">
+                      <SelectValue placeholder="지점을 선택하세요" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {stores.map(store => <SelectItem key={store} value={store}>{store}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="rounded-2xl border bg-white p-4">
+                  <div className="text-xs text-slate-500">전전년 재고행</div>
+                  <div className="mt-1 text-2xl font-semibold">{fmt(parsed?.prev2Rows.length || 0)}</div>
+                </div>
+                <div className="rounded-2xl border bg-white p-4">
+                  <div className="text-xs text-slate-500">전년 재고행 / 사용행</div>
+                  <div className="mt-1 text-2xl font-semibold">{fmt(parsed?.prev1Rows.length || 0)} / {fmt(parsed?.usageRows.length || 0)}</div>
+                </div>
+              </div>
+
+              <div className="rounded-2xl border bg-amber-50 p-4 text-sm leading-6 text-amber-900">
+                <div className="mb-2 font-semibold">이 버전에서 강제로 지키는 규칙</div>
+                <div>1. 전전년 → 전년 → 당해 순서로만 소진합니다.</div>
+                <div>2. 재고보다 많이 전년재고를 쓰지 않습니다. 부족하면 부족수량/부족금액으로 남깁니다.</div>
+                <div>3. 수량만 있고 금액이 없는 행, 금액만 있고 수량이 없는 행은 이상치로 분리합니다.</div>
+                <div>4. 총사용수량/금액과 연차별 합계가 맞지 않으면 검토필요로 표시합니다.</div>
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card className="rounded-3xl shadow-sm">
+            <CardHeader>
+              <CardTitle className="text-xl">현재 상태</CardTitle>
+              <CardDescription>실제 운영에 필요한 핵심 지표만 바로 보이게 구성했습니다.</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="grid grid-cols-2 gap-3">
+                <div className="rounded-2xl bg-white p-4 shadow-sm ring-1 ring-slate-200">
+                  <div className="text-xs text-slate-500">검토 대상 행</div>
+                  <div className="mt-1 text-2xl font-semibold">{fmt(processed?.kpis.anomalyRows || 0)}</div>
+                </div>
+                <div className="rounded-2xl bg-white p-4 shadow-sm ring-1 ring-slate-200">
+                  <div className="text-xs text-slate-500">부족 수량</div>
+                  <div className="mt-1 text-2xl font-semibold">{fmt(processed?.kpis.shortageQty || 0)}</div>
+                </div>
+                <div className="rounded-2xl bg-white p-4 shadow-sm ring-1 ring-slate-200">
+                  <div className="text-xs text-slate-500">부족 금액</div>
+                  <div className="mt-1 text-2xl font-semibold">{fmt(processed?.kpis.shortageAmt || 0)}</div>
+                </div>
+                <div className="rounded-2xl bg-white p-4 shadow-sm ring-1 ring-slate-200">
+                  <div className="text-xs text-slate-500">전년초과 사용 품목군</div>
+                  <div className="mt-1 text-2xl font-semibold">{fmt((processed?.kpis.yyOveruse || 0) + (processed?.kpis.yOveruse || 0))}</div>
+                </div>
+              </div>
+
+              <div className="flex gap-2 pt-2">
+                <Button className="rounded-2xl" disabled={!processed} onClick={() => exportResults(selectedStore, processed)}>
+                  <Download className="mr-2 h-4 w-4" /> 결과 엑셀 다운로드
+                </Button>
+                <Button variant="outline" className="rounded-2xl" onClick={() => { setParsed(null); setFileName(''); setSelectedStore(''); }}>
+                  <RefreshCcw className="mr-2 h-4 w-4" /> 초기화
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+
+        <Tabs defaultValue="summary" className="space-y-4">
+          <TabsList className="grid w-full grid-cols-3 rounded-2xl">
+            <TabsTrigger value="summary">품목군 검증</TabsTrigger>
+            <TabsTrigger value="detail">행별 자동소진</TabsTrigger>
+            <TabsTrigger value="anomaly">부족 / 이상치</TabsTrigger>
+          </TabsList>
+
+          <TabsContent value="summary">
+            <Card className="rounded-3xl shadow-sm">
+              <CardHeader>
+                <CardTitle>품목군 검증 요약</CardTitle>
+                <CardDescription>전전년/전년 재고보다 더 많이 사용했는지와 부족 현황을 한 번에 확인합니다.</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <ScrollArea className="w-full">
+                  <div className="min-w-[1200px] overflow-hidden rounded-2xl border">
+                    <table className="w-full text-sm">
+                      <thead className="bg-slate-200">
+                        <tr>
+                          {['품목군','전전년재고수량','전전년 판매수량','전전년 판매금액','전전년 폐기수량','전전년 폐기금액','전전년 사용수량','전전년 사용금액','전전년 차이','전년재고수량','전년 판매수량','전년 판매금액','전년 폐기수량','전년 폐기금액','전년 사용수량','전년 사용금액','전년 차이','당해 판매수량','당해 판매금액','당해 폐기수량','당해 폐기금액','당해 사용수량','당해 사용금액','부족수량','부족금액','판정'].map(h => (
+                            <th key={h} className="px-4 py-3 text-left font-medium text-slate-700">{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {(processed?.summary || []).map((r) => (
+                          <tr key={r.itemGroup} className="border-t bg-white">
+                            <td className="px-4 py-3 font-medium">{r.itemGroup}</td>
+                            <td className="px-4 py-3">{fmt(r.yyOpenQty)}</td>
+                            <td className="px-4 py-3"><span className="bg-blue-50 px-2 py-1 rounded">{fmt(r.yySaleQty)}</span></td>
+                            <td className="px-4 py-3">{fmt(r.yySaleAmt)}</td>
+                            <td className="px-4 py-3"><span className="bg-blue-100 px-2 py-1 rounded">{fmt(r.yyDiscardQty)}</span></td>
+                            <td className="px-4 py-3">{fmt(r.yyDiscardAmt)}</td>
+                            <td className="px-4 py-3">{fmt(r.yyUsedQty)}</td>
+                            <td className="px-4 py-3">{fmt(r.yyUsedAmt)}</td>
+                            <td className={`px-4 py-3 ${r.yyDiffQty > 0 ? 'text-red-600 font-semibold' : 'text-slate-700'}`}>{fmt(r.yyDiffQty)}</td>
+                            <td className="px-4 py-3">{fmt(r.yOpenQty)}</td>
+                            <td className="px-4 py-3"><span className="bg-green-50 px-2 py-1 rounded">{fmt(r.ySaleQty)}</span></td>
+                            <td className="px-4 py-3">{fmt(r.ySaleAmt)}</td>
+                            <td className="px-4 py-3"><span className="bg-green-100 px-2 py-1 rounded">{fmt(r.yDiscardQty)}</span></td>
+                            <td className="px-4 py-3">{fmt(r.yDiscardAmt)}</td>
+                            <td className="px-4 py-3">{fmt(r.yUsedQty)}</td>
+                            <td className="px-4 py-3">{fmt(r.yUsedAmt)}</td>
+                            <td className={`px-4 py-3 ${r.yDiffQty > 0 ? 'text-red-600 font-semibold' : 'text-slate-700'}`}>{fmt(r.yDiffQty)}</td>
+                            <td className="px-4 py-3"><span className="bg-yellow-50 px-2 py-1 rounded">{fmt(r.currentSaleQty)}</span></td>
+                            <td className="px-4 py-3">{fmt(r.currentSaleAmt)}</td>
+                            <td className="px-4 py-3"><span className="bg-yellow-100 px-2 py-1 rounded">{fmt(r.currentDiscardQty)}</span></td>
+                            <td className="px-4 py-3">{fmt(r.currentDiscardAmt)}</td>
+                            <td className="px-4 py-3">{fmt(r.currentUsedQty)}</td>
+                            <td className="px-4 py-3">{fmt(r.currentUsedAmt)}</td>
+                            <td className={`px-4 py-3 ${r.shortageQty > 0 ? 'text-red-600 font-semibold' : ''}`}>{fmt(r.shortageQty)}</td>
+                            <td className={`px-4 py-3 ${r.shortageAmt > 0 ? 'text-red-600 font-semibold' : ''}`}>{fmt(r.shortageAmt)}</td>
+                            <td className="px-4 py-3">
+                              {r.ok ? <Badge className="rounded-full bg-emerald-100 text-emerald-800 hover:bg-emerald-100">정상</Badge> : <Badge variant="destructive" className="rounded-full">검토필요</Badge>}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </ScrollArea>
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          <TabsContent value="detail">
+            <Card className="rounded-3xl shadow-sm">
+              <CardHeader>
+                <CardTitle>행별 자동소진 결과</CardTitle>
+                <CardDescription>엑셀의 사용 시트를 기준으로, 각 행에 대해 전전년/전년/당해 배분 결과를 보여줍니다.</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <ScrollArea className="w-full">
+                  <div className="min-w-[1800px] overflow-hidden rounded-2xl border">
+                    <table className="w-full text-sm">
+                      <thead className="bg-slate-200">
+                        <tr>
+                          {['일자','품목군','판매수량','판매금액','폐기수량','폐기금액','총사용수량','총사용금액','전전년 판매수량','전전년 판매금액','전전년 폐기수량','전전년 폐기금액','전년 판매수량','전년 판매금액','전년 폐기수량','전년 폐기금액','당해 판매수량','당해 판매금액','당해 폐기수량','당해 폐기금액','부족수량','부족금액','메모'].map(h => (
+                            <th key={h} className="px-4 py-3 text-left font-medium text-slate-700">{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {(processed?.resultRows || []).slice(0, 500).map((r, idx) => {
+                                                    return (
+                            <tr key={`${r.date}-${r.itemGroup}-${idx}`} className="border-t bg-white align-middle">
+                              <td className="px-4 py-3">{r.date}</td>
+                              <td className="px-4 py-3 font-medium">{r.itemGroup}</td>
+                              <td className="px-4 py-3">{fmt(r.saleQty)}</td>
+                              <td className="px-4 py-3">{fmt(r.saleAmt)}</td>
+                              <td className="px-4 py-3">{fmt(r.discardQty)}</td>
+                              <td className="px-4 py-3">{fmt(r.discardAmt)}</td>
+                              <td className="px-4 py-3">{fmt(r.totalQty)}</td>
+                              <td className="px-4 py-3">{fmt(r.totalAmt)}</td>
+                              <td className="px-4 py-3"><span className="bg-blue-50 px-2 py-1 rounded">{fmt(r.yySaleQty)}</span></td>
+                              <td className="px-4 py-3">{fmt(r.yySaleAmt)}</td>
+                              <td className="px-4 py-3"><span className="bg-blue-100 px-2 py-1 rounded">{fmt(r.yyDiscardQty)}</span></td>
+                              <td className="px-4 py-3">{fmt(r.yyDiscardAmt)}</td>
+                              <td className="px-4 py-3"><span className="bg-green-50 px-2 py-1 rounded">{fmt(r.ySaleQty)}</span></td>
+                              <td className="px-4 py-3">{fmt(r.ySaleAmt)}</td>
+                              <td className="px-4 py-3"><span className="bg-green-100 px-2 py-1 rounded">{fmt(r.yDiscardQty)}</span></td>
+                              <td className="px-4 py-3">{fmt(r.yDiscardAmt)}</td>
+                              <td className="px-4 py-3"><span className="bg-yellow-50 px-2 py-1 rounded">{fmt(r.currentSaleQty)}</span></td>
+                              <td className="px-4 py-3">{fmt(r.currentSaleAmt)}</td>
+                              <td className="px-4 py-3"><span className="bg-yellow-100 px-2 py-1 rounded">{fmt(r.currentDiscardQty)}</span></td>
+                              <td className="px-4 py-3">{fmt(r.currentDiscardAmt)}</td>
+                              <td className={`px-4 py-3 ${r.shortageQty > 0 ? 'text-red-600 font-semibold' : ''}`}>{fmt(r.shortageQty)}</td>
+                              <td className={`px-4 py-3 ${r.shortageAmt > 0 ? 'text-red-600 font-semibold' : ''}`}>{fmt(r.shortageAmt)}</td>
+                              <td className="px-4 py-3 text-xs text-slate-600">{[...new Set(r.rowFlags)].join(', ')}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </ScrollArea>
+                <div className="mt-3 text-xs text-slate-500">미리보기에는 최대 500행만 표시합니다. 전체 결과는 엑셀 다운로드에 모두 포함됩니다.</div>
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          <TabsContent value="anomaly">
+            <Card className="rounded-3xl shadow-sm">
+              <CardHeader>
+                <CardTitle>부족 / 이상치 목록</CardTitle>
+                <CardDescription>감사 리스크가 될 수 있는 행만 따로 분리했습니다.</CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                {!processed?.anomalies?.length ? (
+                  <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-6 text-emerald-800">
+                    <div className="flex items-center gap-2 text-lg font-semibold"><CheckCircle2 className="h-5 w-5" /> 현재 검출된 이상치가 없습니다.</div>
+                  </div>
+                ) : (
+                  <div className="overflow-hidden rounded-2xl border">
+                    <table className="w-full text-sm">
+                      <thead className="bg-slate-200">
+                        <tr>
+                          {['일자','품목군','부족수량','부족금액','이상치'].map(h => (
+                            <th key={h} className="px-4 py-3 text-left font-medium text-slate-700">{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {processed.anomalies.map((r, idx) => (
+                          <tr key={`${r.date}-${r.itemGroup}-${idx}`} className="border-t bg-white">
+                            <td className="px-4 py-3">{r.date}</td>
+                            <td className="px-4 py-3 font-medium">{r.itemGroup}</td>
+                            <td className="px-4 py-3 text-red-600 font-semibold">{fmt(r.shortageQty)}</td>
+                            <td className="px-4 py-3 text-red-600 font-semibold">{fmt(r.shortageAmt)}</td>
+                            <td className="px-4 py-3 text-slate-700">{r.flags}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+
+                <div className="rounded-2xl border bg-slate-50 p-4 text-sm leading-6 text-slate-700">
+                  <div className="mb-2 flex items-center gap-2 font-semibold"><AlertTriangle className="h-4 w-4" /> 이 프로토타입이 해결하려는 실제 문제</div>
+                  <div>- 전년재고보다 많이 써놓고도 맞는 것처럼 보이는 문제를 차단합니다.</div>
+                  <div>- 수량만 있고 금액이 없는 행, 금액만 있고 수량이 없는 행을 별도로 표시합니다.</div>
+                  <div>- 총사용수량/금액과 연차별 배분 합계가 어긋나면 다운로드 파일에 바로 남깁니다.</div>
+                </div>
+              </CardContent>
+            </Card>
+          </TabsContent>
+        </Tabs>
+      </div>
+    </div>
+  );
+}
