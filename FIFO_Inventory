@@ -1,0 +1,782 @@
+import React, { useMemo, useState } from "react";
+import * as XLSX from "xlsx";
+import { Upload, Download, AlertCircle, CheckCircle2, FileSpreadsheet } from "lucide-react";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Badge } from "@/components/ui/badge";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { ScrollArea } from "@/components/ui/scroll-area";
+
+/**
+ * 사용명세서 자동소진 웹앱 v1
+ *
+ * 업로드 파일의 필수 시트
+ * - 2025
+ * - 전년재고_DB
+ * - 전전년재고_DB
+ *
+ * 2025 필수 컬럼
+ * - 지점명, 날짜, 품목, 판매수량, 판매금액, 최종폐기
+ *   (최종폐기 = 폐기수량으로 처리)
+ *
+ * 재고 DB 권장 컬럼
+ * - 지점명, 품목, 수량, 금액
+ *   또는
+ * - 지점명, 품목, 재고수량, 재고금액
+ *
+ * 핵심 규칙
+ * 1) FIFO: 전전년 → 전년 → 당해(2025)
+ * 2) 판매/폐기 완전 분리
+ * 3) 재고 초과 사용 금지, 부족수량/부족금액 표시
+ * 4) 이상치 검증
+ * 5) 총사용 vs 연차별 합계 일치 검증
+ */
+
+const MAIN_SHEET = "2025";
+const PREV_SHEET = "전년재고_DB";
+const PREV2_SHEET = "전전년재고_DB";
+
+const REQUIRED_MAIN_COLUMNS = ["지점명", "날짜", "품목", "판매수량", "판매금액", "최종폐기"];
+const STOCK_CANDIDATE_QTY = ["수량", "재고수량", "이월수량", "잔량"];
+const STOCK_CANDIDATE_AMT = ["금액", "재고금액", "이월금액", "잔액"];
+
+function toNumber(v) {
+  if (v === null || v === undefined || v === "") return 0;
+  if (typeof v === "number") return Number.isFinite(v) ? v : 0;
+  const cleaned = String(v).replace(/,/g, "").trim();
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function normalizeText(v) {
+  return String(v ?? "").trim();
+}
+
+function excelDateToJS(value) {
+  if (!value) return null;
+  if (value instanceof Date) return value;
+  if (typeof value === "number") {
+    const utcDays = Math.floor(value - 25569);
+    const utcValue = utcDays * 86400;
+    return new Date(utcValue * 1000);
+  }
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function formatDate(value) {
+  const d = excelDateToJS(value);
+  if (!d) return "";
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function findFirstColumn(row, candidates) {
+  return candidates.find((key) => Object.prototype.hasOwnProperty.call(row, key));
+}
+
+function parseSheet(workbook, sheetName) {
+  const ws = workbook.Sheets[sheetName];
+  if (!ws) throw new Error(`시트 '${sheetName}' 을(를) 찾을 수 없습니다.`);
+  return XLSX.utils.sheet_to_json(ws, { defval: "" });
+}
+
+function validateMainColumns(rows) {
+  if (!rows.length) return [`${MAIN_SHEET} 시트에 데이터가 없습니다.`];
+  const first = rows[0] || {};
+  const cols = Object.keys(first);
+  return REQUIRED_MAIN_COLUMNS.filter((c) => !cols.includes(c)).map((c) => `${MAIN_SHEET} 시트 필수 컬럼 누락: ${c}`);
+}
+
+function validateStockColumns(rows, sheetName) {
+  if (!rows.length) return [`${sheetName} 시트에 데이터가 없습니다.`];
+  const first = rows[0] || {};
+  const cols = Object.keys(first);
+  const qtyCol = STOCK_CANDIDATE_QTY.find((c) => cols.includes(c));
+  const amtCol = STOCK_CANDIDATE_AMT.find((c) => cols.includes(c));
+  const errors = [];
+  if (!cols.includes("지점명")) errors.push(`${sheetName} 시트 필수 컬럼 누락: 지점명`);
+  if (!cols.includes("품목")) errors.push(`${sheetName} 시트 필수 컬럼 누락: 품목`);
+  if (!qtyCol) errors.push(`${sheetName} 시트 수량 컬럼을 찾을 수 없습니다. (${STOCK_CANDIDATE_QTY.join(", ")})`);
+  if (!amtCol) errors.push(`${sheetName} 시트 금액 컬럼을 찾을 수 없습니다. (${STOCK_CANDIDATE_AMT.join(", ")})`);
+  return errors;
+}
+
+function buildOpeningStocks(prev2Rows, prevRows) {
+  const result = new Map();
+
+  const ingest = (rows, yearType) => {
+    if (!rows.length) return;
+    const qtyCol = findFirstColumn(rows[0], STOCK_CANDIDATE_QTY);
+    const amtCol = findFirstColumn(rows[0], STOCK_CANDIDATE_AMT);
+
+    rows.forEach((row) => {
+      const branch = normalizeText(row["지점명"]);
+      const item = normalizeText(row["품목"]);
+      const key = `${branch}__${item}`;
+      const qty = toNumber(row[qtyCol]);
+      const amt = toNumber(row[amtCol]);
+
+      if (!result.has(key)) {
+        result.set(key, {
+          지점명: branch,
+          품목: item,
+          전전년수량: 0,
+          전전년금액: 0,
+          전년수량: 0,
+          전년금액: 0,
+          당해수량: 0,
+          당해금액: 0,
+        });
+      }
+
+      const target = result.get(key);
+      if (yearType === "전전년") {
+        target.전전년수량 += qty;
+        target.전전년금액 += amt;
+      } else if (yearType === "전년") {
+        target.전년수량 += qty;
+        target.전년금액 += amt;
+      }
+    });
+  };
+
+  ingest(prev2Rows, "전전년");
+  ingest(prevRows, "전년");
+  return result;
+}
+
+function aggregateCurrentYearInputs(mainRows) {
+  const map = new Map();
+
+  mainRows.forEach((row, idx) => {
+    const branch = normalizeText(row["지점명"]);
+    const date = formatDate(row["날짜"]);
+    const item = normalizeText(row["품목"]);
+    const saleQty = toNumber(row["판매수량"]);
+    const saleAmt = toNumber(row["판매금액"]);
+    const discardQty = toNumber(row["최종폐기"]);
+
+    const key = `${branch}__${item}`;
+    if (!map.has(key)) {
+      map.set(key, { qty: 0, amt: 0 });
+    }
+
+    // 당해 사용 가능 재고는 판매수량 기준으로 본다.
+    // 폐기는 수량 컬럼이 없으므로 금액만 관리한다.
+    const agg = map.get(key);
+    agg.qty += saleQty;
+    agg.amt += saleAmt;
+  });
+
+  return map;
+}
+
+function enrichWithCurrentYear(openingStocks, currentInputs) {
+  for (const [key, v] of currentInputs.entries()) {
+    if (!openingStocks.has(key)) {
+      const [branch, item] = key.split("__");
+      openingStocks.set(key, {
+        지점명: branch,
+        품목: item,
+        전전년수량: 0,
+        전전년금액: 0,
+        전년수량: 0,
+        전년금액: 0,
+        당해수량: 0,
+        당해금액: 0,
+      });
+    }
+    const target = openingStocks.get(key);
+    target.당해수량 += v.qty;
+    target.당해금액 += v.amt;
+  }
+  return openingStocks;
+}
+
+function validateAnomalies(mainRows) {
+  const issues = [];
+
+  mainRows.forEach((row, idx) => {
+    const rowNo = idx + 2;
+    const saleQty = toNumber(row["판매수량"]);
+    const saleAmt = toNumber(row["판매금액"]);
+    const discardQty = toNumber(row["최종폐기"]);
+    const branch = normalizeText(row["지점명"]);
+    const item = normalizeText(row["품목"]);
+    const date = formatDate(row["날짜"]);
+
+    if (!branch || !item || !date) {
+      issues.push({
+        type: "필수값누락",
+        rowNo,
+        message: `행 ${rowNo}: 지점명/날짜/품목 중 빈 값이 있습니다.`,
+      });
+    }
+
+    if (saleQty === 0 && saleAmt > 0) {
+      issues.push({
+        type: "이상치",
+        rowNo,
+        message: `행 ${rowNo}: 판매수량 0인데 판매금액이 존재합니다.`,
+      });
+    }
+
+    if (saleQty > 0 && saleAmt === 0) {
+      issues.push({
+        type: "이상치",
+        rowNo,
+        message: `행 ${rowNo}: 판매금액 0인데 판매수량이 존재합니다.`,
+      });
+    }
+
+    if (saleQty < 0 || saleAmt < 0 || discardQty < 0) {
+      issues.push({
+        type: "음수값",
+        rowNo,
+        message: `행 ${rowNo}: 음수값이 존재합니다.`,
+      });
+    }
+  });
+
+  return issues;
+}
+
+function allocateByFIFO(totalQty, totalAmt, layers) {
+  let remainQty = toNumber(totalQty);
+  let remainAmt = toNumber(totalAmt);
+
+  const output = {
+    전전년수량: 0,
+    전전년금액: 0,
+    전년수량: 0,
+    전년금액: 0,
+    당해수량: 0,
+    당해금액: 0,
+    부족수량: 0,
+    부족금액: 0,
+  };
+
+  const useLayer = (yearKey, qtyAvailable, amtAvailable) => {
+    const usedQty = Math.min(remainQty, qtyAvailable);
+    remainQty -= usedQty;
+
+    const usedAmt = Math.min(remainAmt, amtAvailable);
+    remainAmt -= usedAmt;
+
+    output[`${yearKey}수량`] += usedQty;
+    output[`${yearKey}금액`] += usedAmt;
+  };
+
+  useLayer("전전년", layers.전전년수량, layers.전전년금액);
+  useLayer("전년", layers.전년수량, layers.전년금액);
+  useLayer("당해", layers.당해수량, layers.당해금액);
+
+  output.부족수량 = remainQty;
+  output.부족금액 = remainAmt;
+
+  return output;
+}
+
+function processWorkbook(workbook) {
+  const mainRows = parseSheet(workbook, MAIN_SHEET);
+  const prevRows = parseSheet(workbook, PREV_SHEET);
+  const prev2Rows = parseSheet(workbook, PREV2_SHEET);
+
+  const schemaErrors = [
+    ...validateMainColumns(mainRows),
+    ...validateStockColumns(prevRows, PREV_SHEET),
+    ...validateStockColumns(prev2Rows, PREV2_SHEET),
+  ];
+
+  const anomalyIssues = validateAnomalies(mainRows);
+
+  if (schemaErrors.length) {
+    return {
+      ok: false,
+      schemaErrors,
+      anomalyIssues,
+      salesRows: [],
+      discardRows: [],
+      summaryRows: [],
+      validationRows: [],
+    };
+  }
+
+  const openingStocks = buildOpeningStocks(prev2Rows, prevRows);
+  const currentInputs = aggregateCurrentYearInputs(mainRows);
+  const stockMap = enrichWithCurrentYear(openingStocks, currentInputs);
+
+  const salesRows = [];
+  const discardRows = [];
+  const validationRows = [];
+
+  // 날짜 순서 보장
+  const sortedMain = [...mainRows].sort((a, b) => {
+    const da = formatDate(a["날짜"]);
+    const db = formatDate(b["날짜"]);
+    return da.localeCompare(db);
+  });
+
+  sortedMain.forEach((row, idx) => {
+    const branch = normalizeText(row["지점명"]);
+    const date = formatDate(row["날짜"]);
+    const item = normalizeText(row["품목"]);
+    const saleQty = toNumber(row["판매수량"]);
+    const saleAmt = toNumber(row["판매금액"]);
+    const discardQty = toNumber(row["최종폐기"]);
+    const key = `${branch}__${item}`;
+
+    if (!stockMap.has(key)) {
+      stockMap.set(key, {
+        지점명: branch,
+        품목: item,
+        전전년수량: 0,
+        전전년금액: 0,
+        전년수량: 0,
+        전년금액: 0,
+        당해수량: 0,
+        당해금액: 0,
+      });
+    }
+
+    const stock = stockMap.get(key);
+
+    if (saleQty > 0 || saleAmt > 0) {
+      const result = allocateByFIFO(saleQty, saleAmt, stock);
+
+      stock.전전년수량 -= result.전전년수량;
+      stock.전전년금액 -= result.전전년금액;
+      stock.전년수량 -= result.전년수량;
+      stock.전년금액 -= result.전년금액;
+      stock.당해수량 -= result.당해수량;
+      stock.당해금액 -= result.당해금액;
+
+      salesRows.push({
+        구분: "판매",
+        지점명: branch,
+        날짜: date,
+        품목: item,
+        총사용수량: saleQty,
+        총사용금액: saleAmt,
+        전전년사용수량: result.전전년수량,
+        전전년사용금액: result.전전년금액,
+        전년사용수량: result.전년수량,
+        전년사용금액: result.전년금액,
+        당해사용수량: result.당해수량,
+        당해사용금액: result.당해금액,
+        부족수량: result.부족수량,
+        부족금액: result.부족금액,
+      });
+
+      const yearQtySum = result.전전년수량 + result.전년수량 + result.당해수량;
+      const yearAmtSum = result.전전년금액 + result.전년금액 + result.당해금액;
+
+      validationRows.push({
+        구분: "판매",
+        지점명: branch,
+        날짜: date,
+        품목: item,
+        총사용수량: saleQty,
+        연차별사용수량합: yearQtySum,
+        수량일치: saleQty === yearQtySum,
+        총사용금액: saleAmt,
+        연차별사용금액합: yearAmtSum,
+        금액일치: saleAmt === yearAmtSum,
+        부족수량: result.부족수량,
+        부족금액: result.부족금액,
+      });
+    }
+
+    if (discardQty > 0) {
+      const totalQtyAvailable = stock.전전년수량 + stock.전년수량 + stock.당해수량;
+      const totalAmtAvailable = stock.전전년금액 + stock.전년금액 + stock.당해금액;
+      const qtyResult = allocateByFIFO(discardQty, 0, stock);
+
+      const usedQty = qtyResult.전전년수량 + qtyResult.전년수량 + qtyResult.당해수량;
+      let 전전년폐기금액 = 0;
+      let 전년폐기금액 = 0;
+      let 당해폐기금액 = 0;
+
+      if (totalQtyAvailable > 0 && totalAmtAvailable > 0 && usedQty > 0) {
+        const unitAmt = totalAmtAvailable / totalQtyAvailable;
+        전전년폐기금액 = Math.round(qtyResult.전전년수량 * unitAmt);
+        전년폐기금액 = Math.round(qtyResult.전년수량 * unitAmt);
+        당해폐기금액 = Math.round(qtyResult.당해수량 * unitAmt);
+
+        const targetTotalAmt = Math.round(usedQty * unitAmt);
+        const allocatedAmt = 전전년폐기금액 + 전년폐기금액 + 당해폐기금액;
+        const diff = targetTotalAmt - allocatedAmt;
+        if (diff !== 0) {
+          당해폐기금액 += diff;
+        }
+      }
+
+      stock.전전년수량 -= qtyResult.전전년수량;
+      stock.전년수량 -= qtyResult.전년수량;
+      stock.당해수량 -= qtyResult.당해수량;
+      stock.전전년금액 -= 전전년폐기금액;
+      stock.전년금액 -= 전년폐기금액;
+      stock.당해금액 -= 당해폐기금액;
+
+      discardRows.push({
+        구분: "폐기",
+        지점명: branch,
+        날짜: date,
+        품목: item,
+        총사용수량: discardQty,
+        총사용금액: 전전년폐기금액 + 전년폐기금액 + 당해폐기금액,
+        전전년사용수량: qtyResult.전전년수량,
+        전전년사용금액: 전전년폐기금액,
+        전년사용수량: qtyResult.전년수량,
+        전년사용금액: 전년폐기금액,
+        당해사용수량: qtyResult.당해수량,
+        당해사용금액: 당해폐기금액,
+        부족수량: qtyResult.부족수량,
+        부족금액: 0,
+      });
+
+      const yearQtySum = qtyResult.전전년수량 + qtyResult.전년수량 + qtyResult.당해수량;
+      const yearAmtSum = 전전년폐기금액 + 전년폐기금액 + 당해폐기금액;
+
+      validationRows.push({
+        구분: "폐기",
+        지점명: branch,
+        날짜: date,
+        품목: item,
+        총사용수량: discardQty,
+        연차별사용수량합: yearQtySum,
+        수량일치: discardQty === yearQtySum,
+        총사용금액: yearAmtSum,
+        연차별사용금액합: yearAmtSum,
+        금액일치: true,
+        부족수량: qtyResult.부족수량,
+        부족금액: 0,
+      });
+    }
+  });
+
+  const summaryMap = new Map();
+  [...salesRows, ...discardRows].forEach((row) => {
+    const key = `${row.구분}__${row.지점명}__${row.품목}`;
+    if (!summaryMap.has(key)) {
+      summaryMap.set(key, {
+        구분: row.구분,
+        지점명: row.지점명,
+        품목: row.품목,
+        총사용수량: 0,
+        총사용금액: 0,
+        전전년사용수량: 0,
+        전전년사용금액: 0,
+        전년사용수량: 0,
+        전년사용금액: 0,
+        당해사용수량: 0,
+        당해사용금액: 0,
+        부족수량: 0,
+        부족금액: 0,
+      });
+    }
+    const acc = summaryMap.get(key);
+    Object.keys(acc).forEach((k) => {
+      if (["구분", "지점명", "품목"].includes(k)) return;
+      acc[k] += toNumber(row[k]);
+    });
+  });
+
+  const summaryRows = Array.from(summaryMap.values());
+
+  return {
+    ok: true,
+    schemaErrors,
+    anomalyIssues,
+    salesRows,
+    discardRows,
+    summaryRows,
+    validationRows,
+  };
+}
+
+function downloadWorkbook(data) {
+  const wb = XLSX.utils.book_new();
+
+  const ws1 = XLSX.utils.json_to_sheet(data.salesRows);
+  const ws2 = XLSX.utils.json_to_sheet(data.discardRows);
+  const ws3 = XLSX.utils.json_to_sheet(data.summaryRows);
+  const ws4 = XLSX.utils.json_to_sheet(data.validationRows);
+  const issueRows = [
+    ...data.schemaErrors.map((msg) => ({ 유형: "스키마오류", 내용: msg })),
+    ...data.anomalyIssues.map((x) => ({ 유형: x.type, 내용: x.message })),
+  ];
+  const ws5 = XLSX.utils.json_to_sheet(issueRows);
+
+  XLSX.utils.book_append_sheet(wb, ws1, "판매자동소진");
+  XLSX.utils.book_append_sheet(wb, ws2, "폐기자동소진");
+  XLSX.utils.book_append_sheet(wb, ws3, "요약");
+  XLSX.utils.book_append_sheet(wb, ws4, "검증");
+  XLSX.utils.book_append_sheet(wb, ws5, "이상치및오류");
+
+  XLSX.writeFile(wb, `FIFO_자동소진_결과.xlsx`);
+}
+
+function StatCard({ title, value, description }) {
+  return (
+    <Card className="rounded-2xl shadow-sm">
+      <CardContent className="p-5">
+        <div className="text-sm text-slate-500">{title}</div>
+        <div className="mt-2 text-2xl font-bold text-slate-900">{value}</div>
+        <div className="mt-1 text-xs text-slate-500">{description}</div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function DataTable({ rows }) {
+  if (!rows?.length) {
+    return <div className="rounded-xl border border-dashed p-8 text-center text-sm text-slate-500">표시할 데이터가 없습니다.</div>;
+  }
+
+  const columns = Object.keys(rows[0]);
+
+  return (
+    <div className="overflow-auto rounded-2xl border bg-white">
+      <table className="min-w-full text-sm">
+        <thead className="sticky top-0 bg-slate-50">
+          <tr>
+            {columns.map((col) => (
+              <th key={col} className="border-b px-3 py-2 text-left font-semibold whitespace-nowrap">
+                {col}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.slice(0, 300).map((row, idx) => (
+            <tr key={idx} className="hover:bg-slate-50">
+              {columns.map((col) => (
+                <td key={col} className="border-b px-3 py-2 align-top whitespace-nowrap">
+                  {String(row[col] ?? "")}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+export default function App() {
+  const [fileName, setFileName] = useState("");
+  const [result, setResult] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [fatalError, setFatalError] = useState("");
+
+  const totals = useMemo(() => {
+    if (!result) {
+      return {
+        salesCount: 0,
+        discardCount: 0,
+        issues: 0,
+        shortages: 0,
+      };
+    }
+
+    const shortages = [...(result.salesRows || []), ...(result.discardRows || [])].filter(
+      (r) => toNumber(r.부족수량) > 0 || toNumber(r.부족금액) > 0
+    ).length;
+
+    return {
+      salesCount: result.salesRows?.length || 0,
+      discardCount: result.discardRows?.length || 0,
+      issues: (result.schemaErrors?.length || 0) + (result.anomalyIssues?.length || 0),
+      shortages,
+    };
+  }, [result]);
+
+  const handleFile = async (file) => {
+    try {
+      setLoading(true);
+      setFatalError("");
+      setResult(null);
+      setFileName(file?.name || "");
+
+      const buffer = await file.arrayBuffer();
+      const workbook = XLSX.read(buffer, { type: "array" });
+      const processed = processWorkbook(workbook);
+      setResult(processed);
+    } catch (err) {
+      setFatalError(err?.message || "파일 처리 중 오류가 발생했습니다.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-100 p-6">
+      <div className="mx-auto max-w-7xl space-y-6">
+        <div className="grid gap-6 lg:grid-cols-[1.2fr_0.8fr]">
+          <Card className="rounded-3xl border-0 shadow-sm">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-3 text-2xl">
+                <FileSpreadsheet className="h-7 w-7" />
+                사용명세서 자동소진 웹프로그램
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-5">
+              <div className="text-sm leading-6 text-slate-600">
+                엑셀 파일을 업로드하면 <span className="font-semibold">2025 / 전년재고_DB / 전전년재고_DB</span> 시트를 읽어
+                판매와 폐기를 분리한 FIFO 자동소진 결과와 검증 시트를 생성합니다. <span className="font-semibold">최종폐기 컬럼은 폐기수량</span>으로 처리됩니다. 최종폐기는 폐기수량으로 계산됩니다.
+              </div>
+
+              <div className="rounded-2xl border border-dashed bg-slate-50 p-5">
+                <div className="flex flex-col gap-3 md:flex-row md:items-center">
+                  <Input
+                    type="file"
+                    accept=".xlsx,.xls"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      if (file) handleFile(file);
+                    }}
+                    className="bg-white"
+                  />
+                  <Badge variant="secondary" className="w-fit rounded-full px-3 py-1 text-xs">
+                    필수 시트 3개
+                  </Badge>
+                </div>
+                {fileName && <div className="mt-3 text-sm text-slate-500">현재 파일: {fileName}</div>}
+              </div>
+
+              <div className="flex flex-wrap gap-3">
+                <Button disabled={!result || loading} onClick={() => downloadWorkbook(result)} className="rounded-2xl">
+                  <Download className="mr-2 h-4 w-4" /> 결과 엑셀 다운로드
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+
+          <div className="grid gap-4">
+            <StatCard title="판매 처리건수" value={loading ? "..." : totals.salesCount} description="판매 자동소진 행 수" />
+            <StatCard title="폐기 처리건수" value={loading ? "..." : totals.discardCount} description="폐기 자동소진 행 수" />
+            <StatCard title="오류/이상치" value={loading ? "..." : totals.issues} description="필수 컬럼 누락 및 이상치 건수" />
+            <StatCard title="부족 발생건" value={loading ? "..." : totals.shortages} description="재고 부족수량/부족금액 표시 건수" />
+          </div>
+        </div>
+
+        {fatalError && (
+          <Alert className="border-red-200 bg-red-50 text-red-900">
+            <AlertCircle className="h-4 w-4" />
+            <AlertTitle>처리 오류</AlertTitle>
+            <AlertDescription>{fatalError}</AlertDescription>
+          </Alert>
+        )}
+
+        {result && (
+          <>
+            {result.ok ? (
+              <Alert className="border-emerald-200 bg-emerald-50 text-emerald-900">
+                <CheckCircle2 className="h-4 w-4" />
+                <AlertTitle>처리 완료</AlertTitle>
+                <AlertDescription>
+                  FIFO 자동소진 계산이 완료되었습니다. 판매와 폐기가 분리되어 표시되며, 부족 발생건과 검증 결과도 함께 확인할 수 있습니다.
+                </AlertDescription>
+              </Alert>
+            ) : (
+              <Alert className="border-amber-200 bg-amber-50 text-amber-900">
+                <AlertCircle className="h-4 w-4" />
+                <AlertTitle>스키마 오류</AlertTitle>
+                <AlertDescription>필수 시트 또는 컬럼 구성이 맞지 않아 계산을 진행하지 못했습니다.</AlertDescription>
+              </Alert>
+            )}
+
+            <Tabs defaultValue="issues" className="space-y-4">
+              <TabsList className="grid w-full grid-cols-5 rounded-2xl">
+                <TabsTrigger value="issues">오류/이상치</TabsTrigger>
+                <TabsTrigger value="sales">판매 결과</TabsTrigger>
+                <TabsTrigger value="discard">폐기 결과</TabsTrigger>
+                <TabsTrigger value="summary">요약</TabsTrigger>
+                <TabsTrigger value="validation">검증</TabsTrigger>
+              </TabsList>
+
+              <TabsContent value="issues">
+                <Card className="rounded-3xl shadow-sm">
+                  <CardHeader>
+                    <CardTitle>오류 및 이상치</CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <ScrollArea className="h-[500px] pr-4">
+                      <div className="space-y-3">
+                        {result.schemaErrors?.map((msg, idx) => (
+                          <Alert key={`s-${idx}`} className="border-amber-200 bg-amber-50">
+                            <AlertCircle className="h-4 w-4" />
+                            <AlertDescription>{msg}</AlertDescription>
+                          </Alert>
+                        ))}
+                        {result.anomalyIssues?.map((issue, idx) => (
+                          <Alert key={`a-${idx}`} className="border-slate-200">
+                            <AlertCircle className="h-4 w-4" />
+                            <AlertDescription>{issue.message}</AlertDescription>
+                          </Alert>
+                        ))}
+                        {!result.schemaErrors?.length && !result.anomalyIssues?.length && (
+                          <div className="rounded-xl border border-dashed p-8 text-center text-sm text-slate-500">오류 및 이상치가 없습니다.</div>
+                        )}
+                      </div>
+                    </ScrollArea>
+                  </CardContent>
+                </Card>
+              </TabsContent>
+
+              <TabsContent value="sales">
+                <Card className="rounded-3xl shadow-sm">
+                  <CardHeader>
+                    <CardTitle>판매 자동소진 결과</CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <DataTable rows={result.salesRows} />
+                  </CardContent>
+                </Card>
+              </TabsContent>
+
+              <TabsContent value="discard">
+                <Card className="rounded-3xl shadow-sm">
+                  <CardHeader>
+                    <CardTitle>폐기 자동소진 결과</CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <DataTable rows={result.discardRows} />
+                  </CardContent>
+                </Card>
+              </TabsContent>
+
+              <TabsContent value="summary">
+                <Card className="rounded-3xl shadow-sm">
+                  <CardHeader>
+                    <CardTitle>지점/품목별 요약</CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <DataTable rows={result.summaryRows} />
+                  </CardContent>
+                </Card>
+              </TabsContent>
+
+              <TabsContent value="validation">
+                <Card className="rounded-3xl shadow-sm">
+                  <CardHeader>
+                    <CardTitle>일치성 검증</CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <DataTable rows={result.validationRows} />
+                  </CardContent>
+                </Card>
+              </TabsContent>
+            </Tabs>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
