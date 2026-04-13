@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>FIFO 자동소진 프로그램</title>
+  <title>사용명세서 자동소진 프로그램</title>
   <link rel="stylesheet" href="style.css" />
   <script src="https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js"></script>
 </head>
@@ -11,27 +11,42 @@
   <div class="container">
     <h1>사용명세서 자동소진 프로그램</h1>
     <p class="desc">
-      엑셀 파일을 업로드하면 2025, 전년재고_DB, 전전년재고_DB 시트를 읽어
-      FIFO(전전년 → 전년 → 당해) 기준으로 판매/폐기 자동소진 결과를 생성합니다.
+      엑셀 파일을 업로드하면
+      <strong>2025</strong>, <strong>전년재고_DB</strong>, <strong>전전년재고_DB</strong>
+      시트를 읽어 FIFO(전전년 → 전년 → 당해) 기준으로 판매/폐기 자동소진 결과를 생성합니다.
     </p>
-    
-<div class="card">
-  <label for="branchFilter" class="label">지점 필터</label>
-  <select id="branchFilter">
-    <option value="전체">전체</option>
-  </select>
-</div>
-    
+
     <div class="card">
       <label for="fileInput" class="label">엑셀 파일 업로드</label>
       <input type="file" id="fileInput" accept=".xlsx,.xls" />
+
       <p class="small">
-        필수 시트: <strong>2025</strong>, <strong>전년재고_DB</strong>, <strong>전전년재고_DB</strong>
+        필수 시트:
+        <strong>2025</strong>,
+        <strong>전년재고_DB</strong>,
+        <strong>전전년재고_DB</strong>
       </p>
+
       <p class="small">
-        2025 필수 컬럼: <strong>지점명, 날짜, 품목, 판매수량, 판매금액, 최종폐기</strong>
+        2025 시트 구조:
+        <strong>A열=날짜, B열=품목, 9행=지점명, 10행=판매수량/판매금액/폐기수량/폐기금액, 11행부터 데이터</strong>
       </p>
-      <button id="downloadBtn" disabled>결과 엑셀 다운로드</button>
+
+      <p class="small">
+        재고 시트 구조:
+        <strong>지점명, 품목, 수량, 금액</strong>
+      </p>
+
+      <div class="button-row">
+        <button id="downloadBtn" disabled>결과 엑셀 다운로드</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <label for="branchFilter" class="label">지점 필터</label>
+      <select id="branchFilter">
+        <option value="전체">전체</option>
+      </select>
     </div>
 
     <div class="grid">
@@ -39,14 +54,17 @@
         <div class="stat-title">판매 처리건수</div>
         <div class="stat-value" id="salesCount">0</div>
       </div>
+
       <div class="stat">
         <div class="stat-title">폐기 처리건수</div>
         <div class="stat-value" id="discardCount">0</div>
       </div>
+
       <div class="stat">
         <div class="stat-title">오류/이상치</div>
         <div class="stat-value" id="issueCount">0</div>
       </div>
+
       <div class="stat">
         <div class="stat-title">부족 발생건</div>
         <div class="stat-value" id="shortageCount">0</div>
@@ -56,6 +74,11 @@
     <div class="card">
       <h2>오류 / 이상치</h2>
       <div id="issues"></div>
+    </div>
+
+    <div class="card">
+      <h2>사용 자동소진 통합 결과</h2>
+      <div class="table-wrap" id="mergedTable"></div>
     </div>
 
     <div class="card">
