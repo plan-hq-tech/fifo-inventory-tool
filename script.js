@@ -61,6 +61,9 @@ function parseSheet(workbook, sheetName, allowEmpty = false) {
 
   return rows;
 }
+function getCellValue(ws, addr) {
+  return ws[addr] ? ws[addr].v : "";
+}
 
 function numberToCol(num) {
   let col = "";
