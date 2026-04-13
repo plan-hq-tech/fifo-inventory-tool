@@ -105,7 +105,7 @@ function sortRowsByBusinessOrder(rows) {
 }
 
 /* =========================
- * 2025 시트(가로형) 파싱
+ * 2025 시트 파싱
  * - A열 = 날짜
  * - B열 = 품목
  * - 9행 = 지점명
@@ -115,7 +115,7 @@ function sortRowsByBusinessOrder(rows) {
  * - 판매수량
  * - 판매금액(사용명세서)
  * - 최종폐기
- * - 금액 (단, 최종폐기 뒤 첫 금액만 폐기금액으로 사용)
+ * - 최종폐기 뒤 첫 번째 금액
  * ========================= */
 function parseHorizontal2025Sheet(workbook) {
   const ws = workbook.Sheets[MAIN_SHEET];
@@ -174,9 +174,6 @@ function parseHorizontal2025Sheet(workbook) {
       continue;
     }
 
-    // 중요:
-    // "금액"은 지점 블록 안에서 여러 번 등장할 수 있으므로
-    // 반드시 "최종폐기"를 찾은 뒤에 처음 등장하는 금액만 폐기금액으로 사용
     if (isAmt(fieldName) && currentBranch._waitingDiscardAmt && !currentBranch.폐기금액Col) {
       currentBranch.폐기금액Col = col;
       currentBranch._waitingDiscardAmt = false;
@@ -245,6 +242,7 @@ function parseInventorySheetFixed(workbook, sheetName) {
 
   const rows = [];
 
+  // 1행 헤더, 2행부터 데이터
   for (let i = 1; i < sheet.length; i++) {
     const row = sheet[i] || [];
 
@@ -263,17 +261,7 @@ function parseInventorySheetFixed(workbook, sheetName) {
     });
   }
 
-  return rows.sort((a, b) => {
-    const ba = normalizeText(a.지점명);
-    const bb = normalizeText(b.지점명);
-    if (ba !== bb) return ba.localeCompare(bb);
-
-    const ia = itemOrderIndex(a.품목);
-    const ib = itemOrderIndex(b.품목);
-    if (ia !== ib) return ia - ib;
-
-    return normalizeText(a.품목).localeCompare(normalizeText(b.품목));
-  });
+  return rows;
 }
 
 /* =========================
@@ -291,6 +279,7 @@ function validateMainColumns(rows) {
 }
 
 function validateStockColumns(rows, sheetName) {
+  // 빈 시트는 허용
   if (!rows.length) return [];
 
   const first = rows[0] || {};
@@ -337,8 +326,6 @@ function validateAnomalies(mainRows) {
 
 /* =========================
  * 재고 맵 생성
- * 당해 재고는 별도 DB가 없으므로 기본 0
- * 부족은 전전년+전년+당해를 다 써도 남을 때만
  * ========================= */
 function buildOpeningStocks(prev2Rows, prevRows) {
   const result = new Map();
@@ -383,6 +370,10 @@ function buildOpeningStocks(prev2Rows, prevRows) {
   return result;
 }
 
+/* =========================
+ * FIFO
+ * 부족은 전전년+전년+당해까지 다 써도 남을 때만
+ * ========================= */
 function allocateQuantityFIFO(totalQty, layers) {
   let remainQty = toNumber(totalQty);
 
@@ -471,7 +462,6 @@ function createDailyCombinedRow(branch, date, item) {
 
 /* =========================
  * 메인 처리
- * 부족은 재고를 다 쓰고도 남을 때만
  * ========================= */
 function processWorkbook(workbook) {
   const mainRows = parseHorizontal2025Sheet(workbook);
@@ -638,18 +628,14 @@ function processWorkbook(workbook) {
       판매금액: saleAmt,
       폐기수량: discardQty,
       폐기금액: discardAmt,
-
       총사용수량: saleQty + discardQty,
       총사용금액: saleAmt + discardAmt,
-
       연차배분수량합:
         saleQtyAlloc.전전년수량 + saleQtyAlloc.전년수량 + saleQtyAlloc.당해수량 +
         discardQtyAlloc.전전년수량 + discardQtyAlloc.전년수량 + discardQtyAlloc.당해수량,
-
       연차배분금액합:
         saleAmtAlloc.전전년금액 + saleAmtAlloc.전년금액 + saleAmtAlloc.당해금액 +
         discardAmtAlloc.전전년금액 + discardAmtAlloc.전년금액 + discardAmtAlloc.당해금액,
-
       부족수량: saleQtyAlloc.부족수량 + discardQtyAlloc.부족수량,
       부족금액: saleAmtAlloc.부족금액 + discardAmtAlloc.부족금액,
     });
