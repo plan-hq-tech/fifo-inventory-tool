@@ -106,11 +106,10 @@ function sortRowsByBusinessOrder(rows) {
 
 /* =========================
  * 2025 시트(가로형) 파싱
- * A열=날짜, B열=품목
- * 9행=지점명
- * 10행=항목명
+ * A열=날짜 / B열=품목
+ * 9행=지점명 / 10행=항목명
  *
- * 읽을 항목명:
+ * 읽는 헤더
  * - 판매수량
  * - 판매금액(사용명세서)
  * - 최종폐기
@@ -140,7 +139,6 @@ function parseHorizontal2025Sheet(workbook) {
     const branchName = normalizeText(getCellValue(ws, `${col}${headerRowBranch}`));
     const fieldName = normalizeHeaderText(getCellValue(ws, `${col}${headerRowField}`));
 
-    // 9행에 지점명이 나오면 새 블록 시작
     if (branchName) {
       if (currentBranch && currentBranch.지점명 && currentBranch.판매수량Col) {
         branchBlocks.push(currentBranch);
@@ -167,7 +165,6 @@ function parseHorizontal2025Sheet(workbook) {
     branchBlocks.push(currentBranch);
   }
 
-  // 판매수량, 판매금액, 폐기수량, 폐기금액 4개가 모두 있는 블록만 사용
   const validBranchBlocks = branchBlocks.filter(
     (b) =>
       b.지점명 &&
@@ -214,7 +211,7 @@ function parseHorizontal2025Sheet(workbook) {
 
 /* =========================
  * 재고 시트 파싱 (A:E 고정)
- * A=지점명, B=품목, C=일자, D=수량, E=금액
+ * A=지점명 / B=품목 / C=일자 / D=수량 / E=금액
  * ========================= */
 function parseInventorySheetFixed(workbook, sheetName) {
   const ws = workbook.Sheets[sheetName];
@@ -225,7 +222,6 @@ function parseInventorySheetFixed(workbook, sheetName) {
 
   const rows = [];
 
-  // 1행 헤더, 2행부터 데이터
   for (let i = 1; i < sheet.length; i++) {
     const row = sheet[i] || [];
 
@@ -296,7 +292,6 @@ function validateAnomalies(mainRows) {
     const discardQty = toNumber(row["최종폐기"]);
     const discardAmt = toNumber(row["폐기금액"]);
 
-    // 판매 수량/금액 쌍 검증
     if (saleQty > 0 && saleAmt === 0) {
       issues.push({ type: "이상치", message: `행 ${rowNo}: 판매수량이 있는데 판매금액이 0입니다.` });
     }
@@ -305,7 +300,6 @@ function validateAnomalies(mainRows) {
       issues.push({ type: "이상치", message: `행 ${rowNo}: 판매금액이 있는데 판매수량이 0입니다.` });
     }
 
-    // 폐기 수량/금액 쌍 검증
     if (discardQty > 0 && discardAmt === 0) {
       issues.push({ type: "이상치", message: `행 ${rowNo}: 폐기수량이 있는데 폐기금액이 0입니다.` });
     }
@@ -323,9 +317,7 @@ function validateAnomalies(mainRows) {
 }
 
 /* =========================
- * FIFO
- * - 재고가 있으면 최대한 먼저 사용
- * - 전전년 -> 전년 -> 당해
+ * 재고 맵 생성
  * ========================= */
 function buildOpeningStocks(prev2Rows, prevRows) {
   const result = new Map();
@@ -370,50 +362,10 @@ function buildOpeningStocks(prev2Rows, prevRows) {
   return result;
 }
 
-function aggregateCurrentYearInputs(mainRows) {
-  const map = new Map();
-
-  mainRows.forEach((row) => {
-    const branch = normalizeText(row["지점명"]);
-    const item = normalizeText(row["품목"]);
-    const saleQty = toNumber(row["판매수량"]);
-    const saleAmt = toNumber(row["판매금액"]);
-    const key = `${branch}__${item}`;
-
-    if (!branch || !item) return;
-
-    if (!map.has(key)) map.set(key, { qty: 0, amt: 0 });
-
-    const agg = map.get(key);
-    agg.qty += saleQty;
-    agg.amt += saleAmt;
-  });
-
-  return map;
-}
-
-function enrichWithCurrentYear(openingStocks, currentInputs) {
-  for (const [key, v] of currentInputs.entries()) {
-    if (!openingStocks.has(key)) {
-      const [branch, item] = key.split("__");
-      openingStocks.set(key, {
-        지점명: branch,
-        품목: item,
-        전전년수량: 0,
-        전전년금액: 0,
-        전년수량: 0,
-        전년금액: 0,
-        당해수량: 0,
-        당해금액: 0,
-      });
-    }
-    const target = openingStocks.get(key);
-    target.당해수량 += v.qty;
-    target.당해금액 += v.amt;
-  }
-  return openingStocks;
-}
-
+/* =========================
+ * 당해는 잔여를 모두 흡수하는 층
+ * 부족은 세 연차를 다 쓰고 남을 때만 발생
+ * ========================= */
 function allocateQuantityFIFO(totalQty, layers) {
   let remainQty = toNumber(totalQty);
 
@@ -431,10 +383,22 @@ function allocateQuantityFIFO(totalQty, layers) {
     output[`${yearKey}수량`] += usedQty;
   };
 
+  // 전전년
   useLayer("전전년", layers.전전년수량);
+
+  // 전년
   useLayer("전년", layers.전년수량);
+
+  // 당해 기보유량 먼저 사용
   useLayer("당해", layers.당해수량);
 
+  // 남은 건 전부 당해 사용으로 흡수
+  if (remainQty > 0) {
+    output.당해수량 += remainQty;
+    remainQty = 0;
+  }
+
+  // 세 연차 다 쓰고도 남을 때만 부족
   output.부족수량 = remainQty;
   return output;
 }
@@ -456,10 +420,22 @@ function allocateAmountFIFO(totalAmt, layers) {
     output[`${yearKey}금액`] += usedAmt;
   };
 
+  // 전전년
   useLayer("전전년", layers.전전년금액);
+
+  // 전년
   useLayer("전년", layers.전년금액);
+
+  // 당해 기보유금액 먼저 사용
   useLayer("당해", layers.당해금액);
 
+  // 남은 건 전부 당해 사용금액으로 흡수
+  if (remainAmt > 0) {
+    output.당해금액 += remainAmt;
+    remainAmt = 0;
+  }
+
+  // 세 연차 다 쓰고도 남을 때만 부족
   output.부족금액 = remainAmt;
   return output;
 }
@@ -502,6 +478,10 @@ function createDailyCombinedRow(branch, date, item) {
 
 /* =========================
  * 메인 처리
+ * 규칙:
+ * 전전년 판매+폐기 + 전년 판매+폐기 + 당해 판매+폐기 = 총사용수량
+ * 금액도 동일
+ * 부족은 세 연차를 다 써도 남을 때만
  * ========================= */
 function processWorkbook(workbook) {
   const mainRows = parseHorizontal2025Sheet(workbook);
@@ -529,8 +509,6 @@ function processWorkbook(workbook) {
   }
 
   const openingStocks = buildOpeningStocks(prev2Rows, prevRows);
-  const currentInputs = aggregateCurrentYearInputs(mainRows);
-  const stockMap = enrichWithCurrentYear(openingStocks, currentInputs);
 
   const salesRows = [];
   const discardRows = [];
@@ -551,8 +529,8 @@ function processWorkbook(workbook) {
     const stockKey = `${branch}__${item}`;
     const dailyKey = `${branch}__${date}__${item}`;
 
-    if (!stockMap.has(stockKey)) {
-      stockMap.set(stockKey, {
+    if (!openingStocks.has(stockKey)) {
+      openingStocks.set(stockKey, {
         지점명: branch,
         품목: item,
         전전년수량: 0,
@@ -568,7 +546,7 @@ function processWorkbook(workbook) {
       dailyMap.set(dailyKey, createDailyCombinedRow(branch, date, item));
     }
 
-    const stock = stockMap.get(stockKey);
+    const stock = openingStocks.get(stockKey);
     const dailyRow = dailyMap.get(dailyKey);
 
     let saleQtyAlloc = { 전전년수량: 0, 전년수량: 0, 당해수량: 0, 부족수량: 0 };
@@ -578,13 +556,14 @@ function processWorkbook(workbook) {
       saleQtyAlloc = allocateQuantityFIFO(saleQty, stock);
       saleAmtAlloc = allocateAmountFIFO(saleAmt, stock);
 
-      stock.전전년수량 -= saleQtyAlloc.전전년수량;
-      stock.전년수량 -= saleQtyAlloc.전년수량;
-      stock.당해수량 -= saleQtyAlloc.당해수량;
+      // 기보유 재고 차감 가능한 부분만 차감
+      stock.전전년수량 -= Math.min(stock.전전년수량, saleQtyAlloc.전전년수량);
+      stock.전년수량 -= Math.min(stock.전년수량, saleQtyAlloc.전년수량);
+      stock.당해수량 -= Math.min(stock.당해수량, saleQtyAlloc.당해수량);
 
-      stock.전전년금액 -= saleAmtAlloc.전전년금액;
-      stock.전년금액 -= saleAmtAlloc.전년금액;
-      stock.당해금액 -= saleAmtAlloc.당해금액;
+      stock.전전년금액 -= Math.min(stock.전전년금액, saleAmtAlloc.전전년금액);
+      stock.전년금액 -= Math.min(stock.전년금액, saleAmtAlloc.전년금액);
+      stock.당해금액 -= Math.min(stock.당해금액, saleAmtAlloc.당해금액);
 
       salesRows.push({
         구분: "판매",
@@ -611,13 +590,13 @@ function processWorkbook(workbook) {
       discardQtyAlloc = allocateQuantityFIFO(discardQty, stock);
       discardAmtAlloc = allocateAmountFIFO(discardAmt, stock);
 
-      stock.전전년수량 -= discardQtyAlloc.전전년수량;
-      stock.전년수량 -= discardQtyAlloc.전년수량;
-      stock.당해수량 -= discardQtyAlloc.당해수량;
+      stock.전전년수량 -= Math.min(stock.전전년수량, discardQtyAlloc.전전년수량);
+      stock.전년수량 -= Math.min(stock.전년수량, discardQtyAlloc.전년수량);
+      stock.당해수량 -= Math.min(stock.당해수량, discardQtyAlloc.당해수량);
 
-      stock.전전년금액 -= discardAmtAlloc.전전년금액;
-      stock.전년금액 -= discardAmtAlloc.전년금액;
-      stock.당해금액 -= discardAmtAlloc.당해금액;
+      stock.전전년금액 -= Math.min(stock.전전년금액, discardAmtAlloc.전전년금액);
+      stock.전년금액 -= Math.min(stock.전년금액, discardAmtAlloc.전년금액);
+      stock.당해금액 -= Math.min(stock.당해금액, discardAmtAlloc.당해금액);
 
       discardRows.push({
         구분: "폐기",
@@ -637,6 +616,7 @@ function processWorkbook(workbook) {
       });
     }
 
+    // 통합표 누적
     dailyRow.판매수량 += saleQty;
     dailyRow.판매금액 += saleAmt;
     dailyRow.폐기수량 += discardQty;
@@ -670,10 +650,18 @@ function processWorkbook(workbook) {
       판매금액: saleAmt,
       폐기수량: discardQty,
       폐기금액: discardAmt,
-      판매_연차합수량: saleQtyAlloc.전전년수량 + saleQtyAlloc.전년수량 + saleQtyAlloc.당해수량,
-      판매_연차합금액: saleAmtAlloc.전전년금액 + saleAmtAlloc.전년금액 + saleAmtAlloc.당해금액,
-      폐기_연차합수량: discardQtyAlloc.전전년수량 + discardQtyAlloc.전년수량 + discardQtyAlloc.당해수량,
-      폐기_연차합금액: discardAmtAlloc.전전년금액 + discardAmtAlloc.전년금액 + discardAmtAlloc.당해금액,
+
+      총사용수량: saleQty + discardQty,
+      총사용금액: saleAmt + discardAmt,
+
+      연차배분수량합:
+        saleQtyAlloc.전전년수량 + saleQtyAlloc.전년수량 + saleQtyAlloc.당해수량 +
+        discardQtyAlloc.전전년수량 + discardQtyAlloc.전년수량 + discardQtyAlloc.당해수량,
+
+      연차배분금액합:
+        saleAmtAlloc.전전년금액 + saleAmtAlloc.전년금액 + saleAmtAlloc.당해금액 +
+        discardAmtAlloc.전전년금액 + discardAmtAlloc.전년금액 + discardAmtAlloc.당해금액,
+
       부족수량: saleQtyAlloc.부족수량 + discardQtyAlloc.부족수량,
       부족금액: saleAmtAlloc.부족금액 + discardAmtAlloc.부족금액,
     });
