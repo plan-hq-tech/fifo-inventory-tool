@@ -45,13 +45,21 @@ function findFirstColumn(row, candidates) {
   return candidates.find((key) => Object.prototype.hasOwnProperty.call(row, key));
 }
 
-function parseSheet(workbook, sheetName) {
+function parseSheet(workbook, sheetName, allowEmpty = false) {
   const ws = workbook.Sheets[sheetName];
-  if (!ws) throw new Error(`시트 '${sheetName}' 을(를) 찾을 수 없습니다.`);
-  return XLSX.utils.sheet_to_json(ws, { defval: "" });
-}
-function getCellValue(ws, addr) {
-  return ws[addr] ? ws[addr].v : "";
+
+  if (!ws) {
+    if (allowEmpty) return [];
+    throw new Error(`시트 '${sheetName}' 을(를) 찾을 수 없습니다.`);
+  }
+
+  const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
+
+  if (!rows.length && allowEmpty) {
+    return [];
+  }
+
+  return rows;
 }
 
 function numberToCol(num) {
@@ -164,16 +172,20 @@ function validateMainColumns(rows) {
 }
 
 function validateStockColumns(rows, sheetName) {
-  if (!rows.length) return [`${sheetName} 시트에 데이터가 없습니다.`];
+  // 재고 시트가 비어 있으면 0재고로 간주하고 통과
+  if (!rows.length) return [];
+
   const first = rows[0] || {};
   const cols = Object.keys(first);
   const qtyCol = STOCK_CANDIDATE_QTY.find((c) => cols.includes(c));
   const amtCol = STOCK_CANDIDATE_AMT.find((c) => cols.includes(c));
   const errors = [];
+
   if (!cols.includes("지점명")) errors.push(`${sheetName} 시트 필수 컬럼 누락: 지점명`);
   if (!cols.includes("품목")) errors.push(`${sheetName} 시트 필수 컬럼 누락: 품목`);
   if (!qtyCol) errors.push(`${sheetName} 시트 수량 컬럼을 찾을 수 없습니다.`);
   if (!amtCol) errors.push(`${sheetName} 시트 금액 컬럼을 찾을 수 없습니다.`);
+
   return errors;
 }
 
@@ -328,9 +340,8 @@ function allocateByFIFO(totalQty, totalAmt, layers) {
 
 function processWorkbook(workbook) {
   const mainRows = parseHorizontal2025Sheet(workbook);
-  const prevRows = parseSheet(workbook, PREV_SHEET);
-  const prev2Rows = parseSheet(workbook, PREV2_SHEET);
-
+const prevRows = parseSheet(workbook, PREV_SHEET, true);
+const prev2Rows = parseSheet(workbook, PREV2_SHEET, true);
   const schemaErrors = [
     ...validateMainColumns(mainRows),
     ...validateStockColumns(prevRows, PREV_SHEET),
