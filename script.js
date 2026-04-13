@@ -2,8 +2,6 @@ const MAIN_SHEET = "2025";
 const PREV_SHEET = "전년재고_DB";
 const PREV2_SHEET = "전전년재고_DB";
 
-const REQUIRED_MAIN_COLUMNS = ["지점명", "날짜", "품목", "판매수량", "판매금액", "최종폐기"];
-
 const ITEM_ORDER = [
   "의류",
   "잡화",
@@ -106,16 +104,6 @@ function sortRowsByBusinessOrder(rows) {
 
 /* =========================
  * 2025 시트 파싱
- * - A열 = 날짜
- * - B열 = 품목
- * - 9행 = 지점명
- * - 10행 = 항목명
- *
- * 읽는 헤더:
- * - 판매수량
- * - 판매금액(사용명세서)
- * - 최종폐기
- * - 최종폐기 뒤 첫 번째 금액
  * ========================= */
 function parseHorizontal2025Sheet(workbook) {
   const ws = workbook.Sheets[MAIN_SHEET];
@@ -130,11 +118,6 @@ function parseHorizontal2025Sheet(workbook) {
   const rows = [];
   const branchBlocks = [];
   let currentBranch = null;
-
-  const isSaleQty = (v) => v === "판매수량";
-  const isSaleAmt = (v) => v === "판매금액(사용명세서)";
-  const isDiscardQty = (v) => v === "최종폐기";
-  const isAmt = (v) => v === "금액";
 
   for (let c = 1; c <= range.e.c + 1; c++) {
     const col = numberToCol(c);
@@ -152,31 +135,31 @@ function parseHorizontal2025Sheet(workbook) {
         판매금액Col: null,
         폐기수량Col: null,
         폐기금액Col: null,
-        _waitingDiscardAmt: false,
+        waitingDiscardAmt: false,
       };
     }
 
     if (!currentBranch) continue;
 
-    if (isSaleQty(fieldName)) {
+    if (fieldName === "판매수량") {
       currentBranch.판매수량Col = col;
       continue;
     }
 
-    if (isSaleAmt(fieldName)) {
+    if (fieldName === "판매금액(사용명세서)") {
       currentBranch.판매금액Col = col;
       continue;
     }
 
-    if (isDiscardQty(fieldName)) {
+    if (fieldName === "최종폐기") {
       currentBranch.폐기수량Col = col;
-      currentBranch._waitingDiscardAmt = true;
+      currentBranch.waitingDiscardAmt = true;
       continue;
     }
 
-    if (isAmt(fieldName) && currentBranch._waitingDiscardAmt && !currentBranch.폐기금액Col) {
+    if (fieldName === "금액" && currentBranch.waitingDiscardAmt && !currentBranch.폐기금액Col) {
       currentBranch.폐기금액Col = col;
-      currentBranch._waitingDiscardAmt = false;
+      currentBranch.waitingDiscardAmt = false;
       continue;
     }
   }
@@ -230,8 +213,9 @@ function parseHorizontal2025Sheet(workbook) {
 }
 
 /* =========================
- * 재고 시트 파싱 (A:E 고정)
- * A=지점명 / B=품목 / C=일자 / D=수량 / E=금액
+ * 재고 시트 파싱
+ * A=지점명 / B=품목 / D=수량 / E=금액
+ * 헤더 탐색 없음
  * ========================= */
 function parseInventorySheetFixed(workbook, sheetName) {
   const ws = workbook.Sheets[sheetName];
@@ -242,7 +226,6 @@ function parseInventorySheetFixed(workbook, sheetName) {
 
   const rows = [];
 
-  // 1행 헤더, 2행부터 데이터
   for (let i = 1; i < sheet.length; i++) {
     const row = sheet[i] || [];
 
@@ -267,33 +250,6 @@ function parseInventorySheetFixed(workbook, sheetName) {
 /* =========================
  * 검증
  * ========================= */
-function validateMainColumns(rows) {
-  if (!rows.length) return [`${MAIN_SHEET} 시트에서 변환된 사용 데이터가 없습니다.`];
-
-  const first = rows[0] || {};
-  const cols = Object.keys(first);
-
-  return REQUIRED_MAIN_COLUMNS
-    .filter((c) => !cols.includes(c))
-    .map((c) => `${MAIN_SHEET} 변환 데이터 필수 컬럼 누락: ${c}`);
-}
-
-function validateStockColumns(rows, sheetName) {
-  // 빈 시트는 허용
-  if (!rows.length) return [];
-
-  const first = rows[0] || {};
-  const cols = Object.keys(first);
-  const errors = [];
-
-  if (!cols.includes("지점명")) errors.push(`${sheetName} 시트 필수 컬럼 누락: 지점명`);
-  if (!cols.includes("품목")) errors.push(`${sheetName} 시트 필수 컬럼 누락: 품목`);
-  if (!cols.includes("수량")) errors.push(`${sheetName} 시트 수량 컬럼을 찾을 수 없습니다.`);
-  if (!cols.includes("금액")) errors.push(`${sheetName} 시트 금액 컬럼을 찾을 수 없습니다.`);
-
-  return errors;
-}
-
 function validateAnomalies(mainRows) {
   const issues = [];
 
@@ -316,27 +272,24 @@ function validateAnomalies(mainRows) {
     if (discardQty === 0 && discardAmt > 0) {
       issues.push({ type: "이상치", message: `행 ${rowNo}: 폐기금액이 있는데 폐기수량이 0입니다.` });
     }
-    if (saleQty < 0 || saleAmt < 0 || discardQty < 0 || discardAmt < 0) {
-      issues.push({ type: "음수값", message: `행 ${rowNo}: 음수값이 존재합니다.` });
-    }
   });
 
   return issues;
 }
 
 /* =========================
- * 재고 맵 생성
+ * 재고 맵
  * ========================= */
 function buildOpeningStocks(prev2Rows, prevRows) {
   const result = new Map();
 
   const ingest = (rows, yearType) => {
     rows.forEach((row) => {
-      const branch = normalizeText(row["지점명"]);
-      const item = normalizeText(row["품목"]);
+      const branch = normalizeText(row.지점명);
+      const item = normalizeText(row.품목);
       const key = `${branch}__${item}`;
-      const qty = toNumber(row["수량"]);
-      const amt = toNumber(row["금액"]);
+      const qty = toNumber(row.수량);
+      const amt = toNumber(row.금액);
 
       if (!branch || !item) return;
 
@@ -354,6 +307,7 @@ function buildOpeningStocks(prev2Rows, prevRows) {
       }
 
       const target = result.get(key);
+
       if (yearType === "전전년") {
         target.전전년수량 += qty;
         target.전전년금액 += amt;
@@ -372,7 +326,7 @@ function buildOpeningStocks(prev2Rows, prevRows) {
 
 /* =========================
  * FIFO
- * 부족은 전전년+전년+당해까지 다 써도 남을 때만
+ * 부족은 세 연차 다 쓴 뒤 남을 때만
  * ========================= */
 function allocateQuantityFIFO(totalQty, layers) {
   let remainQty = toNumber(totalQty);
@@ -385,8 +339,7 @@ function allocateQuantityFIFO(totalQty, layers) {
   };
 
   const useLayer = (yearKey, qtyAvailable) => {
-    const usable = Math.max(0, qtyAvailable);
-    const usedQty = Math.min(remainQty, usable);
+    const usedQty = Math.min(remainQty, Math.max(0, qtyAvailable));
     remainQty -= usedQty;
     output[`${yearKey}수량`] += usedQty;
   };
@@ -410,8 +363,7 @@ function allocateAmountFIFO(totalAmt, layers) {
   };
 
   const useLayer = (yearKey, amtAvailable) => {
-    const usable = Math.max(0, amtAvailable);
-    const usedAmt = Math.min(remainAmt, usable);
+    const usedAmt = Math.min(remainAmt, Math.max(0, amtAvailable));
     remainAmt -= usedAmt;
     output[`${yearKey}금액`] += usedAmt;
   };
@@ -468,26 +420,7 @@ function processWorkbook(workbook) {
   const prevRows = parseInventorySheetFixed(workbook, PREV_SHEET);
   const prev2Rows = parseInventorySheetFixed(workbook, PREV2_SHEET);
 
-  const schemaErrors = [
-    ...validateMainColumns(mainRows),
-    ...validateStockColumns(prevRows, PREV_SHEET),
-    ...validateStockColumns(prev2Rows, PREV2_SHEET),
-  ];
-
   const anomalyIssues = validateAnomalies(mainRows);
-
-  if (schemaErrors.length) {
-    return {
-      ok: false,
-      schemaErrors,
-      anomalyIssues,
-      mergedDailyRows: [],
-      salesRows: [],
-      discardRows: [],
-      validationRows: [],
-    };
-  }
-
   const openingStocks = buildOpeningStocks(prev2Rows, prevRows);
 
   const salesRows = [];
@@ -624,10 +557,6 @@ function processWorkbook(workbook) {
       지점명: branch,
       날짜: date,
       품목: item,
-      판매수량: saleQty,
-      판매금액: saleAmt,
-      폐기수량: discardQty,
-      폐기금액: discardAmt,
       총사용수량: saleQty + discardQty,
       총사용금액: saleAmt + discardAmt,
       연차배분수량합:
@@ -645,7 +574,7 @@ function processWorkbook(workbook) {
 
   return {
     ok: true,
-    schemaErrors,
+    schemaErrors: [],
     anomalyIssues,
     mergedDailyRows,
     salesRows,
