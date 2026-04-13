@@ -11,7 +11,7 @@ let latestResult = null;
 function toNumber(v) {
   if (v === null || v === undefined || v === "") return 0;
   if (typeof v === "number") return Number.isFinite(v) ? v : 0;
-  const cleaned = String(v).replace(/,/g, "").trim();
+  const cleaned = String(v).replace(/,/g, "").replace(/-/g, "0").trim();
   const n = Number(cleaned);
   return Number.isFinite(n) ? n : 0;
 }
@@ -34,7 +34,7 @@ function excelDateToJS(value) {
 
 function formatDate(value) {
   const d = excelDateToJS(value);
-  if (!d) return "";
+  if (!d) return normalizeText(value);
   const yyyy = d.getFullYear();
   const mm = String(d.getMonth() + 1).padStart(2, "0");
   const dd = String(d.getDate()).padStart(2, "0");
@@ -61,6 +61,7 @@ function parseSheet(workbook, sheetName, allowEmpty = false) {
 
   return rows;
 }
+
 function getCellValue(ws, addr) {
   return ws[addr] ? ws[addr].v : "";
 }
@@ -82,6 +83,7 @@ function normalizeHeaderText(v) {
 function parseHorizontal2025Sheet(workbook) {
   const ws = workbook.Sheets[MAIN_SHEET];
   if (!ws) throw new Error(`시트 '${MAIN_SHEET}' 을(를) 찾을 수 없습니다.`);
+  if (!ws["!ref"]) throw new Error(`시트 '${MAIN_SHEET}' 의 범위를 읽을 수 없습니다.`);
 
   const range = XLSX.utils.decode_range(ws["!ref"]);
   const headerRowBranch = 9;
@@ -91,7 +93,6 @@ function parseHorizontal2025Sheet(workbook) {
   const rows = [];
   const branchBlocks = [];
 
-  // 9행 = 지점명 / 10행 = 항목명
   for (let c = 1; c <= range.e.c + 1; c++) {
     const col = numberToCol(c);
     const branchName = normalizeText(getCellValue(ws, `${col}${headerRowBranch}`));
@@ -140,7 +141,7 @@ function parseHorizontal2025Sheet(workbook) {
 
     branchBlocks.forEach((block) => {
       const 판매수량 = toNumber(getCellValue(ws, `${block.판매수량Col}${r}`));
-      const 판매금액 = toNumber(getCellValue(ws, `${block.판매금액Col}${r}`));
+      const 판매금액 = block.판매금액Col ? toNumber(getCellValue(ws, `${block.판매금액Col}${r}`)) : 0;
       const 폐기수량 = block.폐기수량Col ? toNumber(getCellValue(ws, `${block.폐기수량Col}${r}`)) : 0;
       const 폐기금액 = block.폐기금액Col ? toNumber(getCellValue(ws, `${block.폐기금액Col}${r}`)) : 0;
 
@@ -175,7 +176,6 @@ function validateMainColumns(rows) {
 }
 
 function validateStockColumns(rows, sheetName) {
-  // 재고 시트가 비어 있으면 0재고로 간주하고 통과
   if (!rows.length) return [];
 
   const first = rows[0] || {};
@@ -207,6 +207,8 @@ function buildOpeningStocks(prev2Rows, prevRows) {
       const qty = toNumber(row[qtyCol]);
       const amt = toNumber(row[amtCol]);
 
+      if (!branch || !item) return;
+
       if (!result.has(key)) {
         result.set(key, {
           지점명: branch,
@@ -233,6 +235,7 @@ function buildOpeningStocks(prev2Rows, prevRows) {
 
   ingest(prev2Rows, "전전년");
   ingest(prevRows, "전년");
+
   return result;
 }
 
@@ -245,6 +248,8 @@ function aggregateCurrentYearInputs(mainRows) {
     const saleQty = toNumber(row["판매수량"]);
     const saleAmt = toNumber(row["판매금액"]);
     const key = `${branch}__${item}`;
+
+    if (!branch || !item) return;
 
     if (!map.has(key)) {
       map.set(key, { qty: 0, amt: 0 });
@@ -284,7 +289,7 @@ function validateAnomalies(mainRows) {
   const issues = [];
 
   mainRows.forEach((row, idx) => {
-    const rowNo = idx + 2;
+    const rowNo = idx + 1;
     const saleQty = toNumber(row["판매수량"]);
     const saleAmt = toNumber(row["판매금액"]);
     const discardQty = toNumber(row["최종폐기"]);
@@ -321,10 +326,10 @@ function allocateByFIFO(totalQty, totalAmt, layers) {
   };
 
   const useLayer = (yearKey, qtyAvailable, amtAvailable) => {
-    const usedQty = Math.min(remainQty, qtyAvailable);
+    const usedQty = Math.min(remainQty, Math.max(0, qtyAvailable));
     remainQty -= usedQty;
 
-    const usedAmt = Math.min(remainAmt, amtAvailable);
+    const usedAmt = Math.min(remainAmt, Math.max(0, amtAvailable));
     remainAmt -= usedAmt;
 
     output[`${yearKey}수량`] += usedQty;
@@ -343,8 +348,9 @@ function allocateByFIFO(totalQty, totalAmt, layers) {
 
 function processWorkbook(workbook) {
   const mainRows = parseHorizontal2025Sheet(workbook);
-const prevRows = parseSheet(workbook, PREV_SHEET, true);
-const prev2Rows = parseSheet(workbook, PREV2_SHEET, true);
+  const prevRows = parseSheet(workbook, PREV_SHEET, true);
+  const prev2Rows = parseSheet(workbook, PREV2_SHEET, true);
+
   const schemaErrors = [
     ...validateMainColumns(mainRows),
     ...validateStockColumns(prevRows, PREV_SHEET),
@@ -373,18 +379,20 @@ const prev2Rows = parseSheet(workbook, PREV2_SHEET, true);
   const validationRows = [];
 
   const sortedMain = [...mainRows].sort((a, b) => {
-    const da = formatDate(a["날짜"]);
-    const db = formatDate(b["날짜"]);
-    return da.localeCompare(db);
+    const da = normalizeText(a["날짜"]);
+    const db = normalizeText(b["날짜"]);
+    if (da !== db) return da.localeCompare(db);
+    return normalizeText(a["품목"]).localeCompare(normalizeText(b["품목"]));
   });
 
   sortedMain.forEach((row) => {
     const branch = normalizeText(row["지점명"]);
-    const date = formatDate(row["날짜"]);
+    const date = normalizeText(row["날짜"]);
     const item = normalizeText(row["품목"]);
     const saleQty = toNumber(row["판매수량"]);
     const saleAmt = toNumber(row["판매금액"]);
     const discardQty = toNumber(row["최종폐기"]);
+    const discardAmtInput = toNumber(row["폐기금액"]);
     const key = `${branch}__${item}`;
 
     if (!stockMap.has(key)) {
@@ -445,36 +453,52 @@ const prev2Rows = parseSheet(workbook, PREV2_SHEET, true);
       });
     }
 
-    if (discardQty > 0) {
-      const totalQtyAvailable = stock.전전년수량 + stock.전년수량 + stock.당해수량;
-      const totalAmtAvailable = stock.전전년금액 + stock.전년금액 + stock.당해금액;
-      const qtyResult = allocateByFIFO(discardQty, 0, stock);
-
-      const usedQty = qtyResult.전전년수량 + qtyResult.전년수량 + qtyResult.당해수량;
+    if (discardQty > 0 || discardAmtInput > 0) {
+      let qtyResult = allocateByFIFO(discardQty, 0, stock);
 
       let 전전년폐기금액 = 0;
       let 전년폐기금액 = 0;
       let 당해폐기금액 = 0;
 
-      if (totalQtyAvailable > 0 && totalAmtAvailable > 0 && usedQty > 0) {
-        const unitAmt = totalAmtAvailable / totalQtyAvailable;
+      if (discardAmtInput > 0) {
+        let remainDiscardAmt = discardAmtInput;
 
-        전전년폐기금액 = Math.round(qtyResult.전전년수량 * unitAmt);
-        전년폐기금액 = Math.round(qtyResult.전년수량 * unitAmt);
-        당해폐기금액 = Math.round(qtyResult.당해수량 * unitAmt);
+        const amtFromPrev2 = Math.min(remainDiscardAmt, Math.max(0, stock.전전년금액));
+        remainDiscardAmt -= amtFromPrev2;
 
-        const targetTotalAmt = Math.round(usedQty * unitAmt);
-        const allocatedAmt = 전전년폐기금액 + 전년폐기금액 + 당해폐기금액;
-        const diff = targetTotalAmt - allocatedAmt;
+        const amtFromPrev = Math.min(remainDiscardAmt, Math.max(0, stock.전년금액));
+        remainDiscardAmt -= amtFromPrev;
 
-        if (diff !== 0) {
-          당해폐기금액 += diff;
+        const amtFromCurrent = Math.min(remainDiscardAmt, Math.max(0, stock.당해금액));
+        remainDiscardAmt -= amtFromCurrent;
+
+        전전년폐기금액 = amtFromPrev2;
+        전년폐기금액 = amtFromPrev;
+        당해폐기금액 = amtFromCurrent;
+      } else {
+        const totalQtyAvailable = stock.전전년수량 + stock.전년수량 + stock.당해수량;
+        const totalAmtAvailable = stock.전전년금액 + stock.전년금액 + stock.당해금액;
+        const usedQty = qtyResult.전전년수량 + qtyResult.전년수량 + qtyResult.당해수량;
+
+        if (totalQtyAvailable > 0 && totalAmtAvailable > 0 && usedQty > 0) {
+          const unitAmt = totalAmtAvailable / totalQtyAvailable;
+          전전년폐기금액 = Math.round(qtyResult.전전년수량 * unitAmt);
+          전년폐기금액 = Math.round(qtyResult.전년수량 * unitAmt);
+          당해폐기금액 = Math.round(qtyResult.당해수량 * unitAmt);
+
+          const targetTotalAmt = Math.round(usedQty * unitAmt);
+          const allocatedAmt = 전전년폐기금액 + 전년폐기금액 + 당해폐기금액;
+          const diff = targetTotalAmt - allocatedAmt;
+          if (diff !== 0) {
+            당해폐기금액 += diff;
+          }
         }
       }
 
       stock.전전년수량 -= qtyResult.전전년수량;
       stock.전년수량 -= qtyResult.전년수량;
       stock.당해수량 -= qtyResult.당해수량;
+
       stock.전전년금액 -= 전전년폐기금액;
       stock.전년금액 -= 전년폐기금액;
       stock.당해금액 -= 당해폐기금액;
@@ -486,6 +510,7 @@ const prev2Rows = parseSheet(workbook, PREV2_SHEET, true);
         품목: item,
         총사용수량: discardQty,
         총사용금액: 전전년폐기금액 + 전년폐기금액 + 당해폐기금액,
+        입력폐기금액: discardAmtInput,
         전전년사용수량: qtyResult.전전년수량,
         전전년사용금액: 전전년폐기금액,
         전년사용수량: qtyResult.전년수량,
@@ -493,7 +518,7 @@ const prev2Rows = parseSheet(workbook, PREV2_SHEET, true);
         당해사용수량: qtyResult.당해수량,
         당해사용금액: 당해폐기금액,
         부족수량: qtyResult.부족수량,
-        부족금액: 0,
+        부족금액: Math.max(0, discardAmtInput - (전전년폐기금액 + 전년폐기금액 + 당해폐기금액)),
       });
 
       validationRows.push({
@@ -508,7 +533,7 @@ const prev2Rows = parseSheet(workbook, PREV2_SHEET, true);
         연차별사용금액합: 전전년폐기금액 + 전년폐기금액 + 당해폐기금액,
         금액일치: true,
         부족수량: qtyResult.부족수량,
-        부족금액: 0,
+        부족금액: Math.max(0, discardAmtInput - (전전년폐기금액 + 전년폐기금액 + 당해폐기금액)),
       });
     }
   });
