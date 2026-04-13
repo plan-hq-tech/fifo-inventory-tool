@@ -108,40 +108,46 @@ function parseHorizontal2025Sheet(workbook) {
 
   const rows = [];
   const branchBlocks = [];
+  let currentBranch = null;
 
+  // 9행/10행 전체를 훑어서 지점 블록 구성
   for (let c = 1; c <= range.e.c + 1; c++) {
     const col = numberToCol(c);
     const branchName = normalizeText(getCellValue(ws, `${col}${headerRowBranch}`));
     const fieldName = normalizeHeaderText(getCellValue(ws, `${col}${headerRowField}`));
 
-    if (branchName && fieldName === "판매수량") {
-      const block = {
+    if (branchName) {
+      if (currentBranch && currentBranch.지점명 && currentBranch.판매수량Col) {
+        branchBlocks.push(currentBranch);
+      }
+
+      currentBranch = {
         지점명: branchName,
-        판매수량Col: col,
+        판매수량Col: null,
         판매금액Col: null,
         폐기수량Col: null,
         폐기금액Col: null,
       };
-
-      for (let c2 = c; c2 <= range.e.c + 1; c2++) {
-        const col2 = numberToCol(c2);
-        const branch2 = normalizeText(getCellValue(ws, `${col2}${headerRowBranch}`));
-        const field2 = normalizeHeaderText(getCellValue(ws, `${col2}${headerRowField}`));
-
-        if (c2 > c && branch2 && field2 === "판매수량") break;
-
-        if (field2 === "판매수량") block.판매수량Col = col2;
-        if (field2 === "판매금액") block.판매금액Col = col2;
-        if (field2 === "폐기수량" || field2 === "최종폐기") block.폐기수량Col = col2;
-        if (field2 === "폐기금액") block.폐기금액Col = col2;
-      }
-
-      branchBlocks.push(block);
     }
+
+    if (!currentBranch) continue;
+
+    if (fieldName === "판매수량") currentBranch.판매수량Col = col;
+    if (fieldName === "판매금액") currentBranch.판매금액Col = col;
+    if (fieldName === "폐기수량" || fieldName === "최종폐기") currentBranch.폐기수량Col = col;
+    if (fieldName === "폐기금액") currentBranch.폐기금액Col = col;
   }
 
-  if (!branchBlocks.length) {
-    throw new Error("2025 시트에서 지점 블록을 찾지 못했습니다. 9행=지점명, 10행=판매수량/판매금액/폐기수량/폐기금액 구조인지 확인해주세요.");
+  if (currentBranch && currentBranch.지점명 && currentBranch.판매수량Col) {
+    branchBlocks.push(currentBranch);
+  }
+
+  const validBranchBlocks = branchBlocks.filter(
+    (b) => b.지점명 && b.판매수량Col && b.판매금액Col && b.폐기수량Col && b.폐기금액Col
+  );
+
+  if (!validBranchBlocks.length) {
+    throw new Error("2025 시트에서 유효한 지점 블록을 찾지 못했습니다. 9행 지점명, 10행 판매수량/판매금액/폐기수량/폐기금액 구조를 확인해주세요.");
   }
 
   for (let r = dataStartRow; r <= range.e.r + 1; r++) {
@@ -150,11 +156,11 @@ function parseHorizontal2025Sheet(workbook) {
 
     if (!날짜 && !품목) continue;
 
-    branchBlocks.forEach((block) => {
+    validBranchBlocks.forEach((block) => {
       const 판매수량 = toNumber(getCellValue(ws, `${block.판매수량Col}${r}`));
-      const 판매금액 = block.판매금액Col ? toNumber(getCellValue(ws, `${block.판매금액Col}${r}`)) : 0;
-      const 폐기수량 = block.폐기수량Col ? toNumber(getCellValue(ws, `${block.폐기수량Col}${r}`)) : 0;
-      const 폐기금액 = block.폐기금액Col ? toNumber(getCellValue(ws, `${block.폐기금액Col}${r}`)) : 0;
+      const 판매금액 = toNumber(getCellValue(ws, `${block.판매금액Col}${r}`));
+      const 폐기수량 = toNumber(getCellValue(ws, `${block.폐기수량Col}${r}`));
+      const 폐기금액 = toNumber(getCellValue(ws, `${block.폐기금액Col}${r}`));
 
       if (판매수량 === 0 && 판매금액 === 0 && 폐기수량 === 0 && 폐기금액 === 0) return;
 
