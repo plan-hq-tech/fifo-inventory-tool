@@ -721,17 +721,25 @@ function renderIssues(result) {
   });
 }
 
-function createTable(rows) {
+function createTable(rows, maxRows = 200) {
   if (!rows || !rows.length) return "<p>데이터가 없습니다.</p>";
 
-  const cols = Object.keys(rows[0]);
-  let html = "<table><thead><tr>";
+  const limitedRows = rows.slice(0, maxRows);
+  const cols = Object.keys(limitedRows[0]);
+
+  let html = "";
+
+  if (rows.length > maxRows) {
+    html += `<p style="margin:0 0 12px; color:#6b7280; font-size:13px;">총 ${rows.length.toLocaleString()}행 중 ${maxRows.toLocaleString()}행만 화면에 표시합니다. 전체 데이터는 엑셀 다운로드에서 확인하세요.</p>`;
+  }
+
+  html += "<table><thead><tr>";
   cols.forEach((c) => {
     html += `<th>${c}</th>`;
   });
   html += "</tr></thead><tbody>";
 
-  rows.forEach((row) => {
+  limitedRows.forEach((row) => {
     html += "<tr>";
     cols.forEach((c) => {
       html += `<td>${row[c] ?? ""}</td>`;
@@ -742,7 +750,6 @@ function createTable(rows) {
   html += "</tbody></table>";
   return html;
 }
-
 function populateBranchFilter(result) {
   const select = document.getElementById("branchFilter");
   if (!select) return;
@@ -789,18 +796,17 @@ function renderTables(result) {
       : result.validationRows.filter((row) => row.지점명 === selectedBranch);
 
   const mergedTable = document.getElementById("mergedTable");
-  if (mergedTable) mergedTable.innerHTML = createTable(mergedDailyRows);
+  if (mergedTable) mergedTable.innerHTML = createTable(mergedDailyRows, 300);
 
   const salesTable = document.getElementById("salesTable");
-  if (salesTable) salesTable.innerHTML = createTable(salesRows);
+  if (salesTable) salesTable.innerHTML = createTable(salesRows, 150);
 
   const discardTable = document.getElementById("discardTable");
-  if (discardTable) discardTable.innerHTML = createTable(discardRows);
+  if (discardTable) discardTable.innerHTML = createTable(discardRows, 150);
 
   const validationTable = document.getElementById("validationTable");
-  if (validationTable) validationTable.innerHTML = createTable(validationRows);
+  if (validationTable) validationTable.innerHTML = createTable(validationRows, 150);
 }
-
 function updateStats(result) {
   document.getElementById("salesCount").textContent = result.salesRows.length;
   document.getElementById("discardCount").textContent = result.discardRows.length;
