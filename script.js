@@ -56,10 +56,6 @@ function normalizeHeaderText(v) {
   return String(v ?? "").replace(/\s+/g, "").trim();
 }
 
-function findFirstColumn(row, candidates) {
-  return candidates.find((key) => Object.prototype.hasOwnProperty.call(row, key));
-}
-
 function parseHorizontal2025Sheet(workbook) {
   const ws = workbook.Sheets[MAIN_SHEET];
   if (!ws) throw new Error(`시트 '${MAIN_SHEET}' 을(를) 찾을 수 없습니다.`);
@@ -111,6 +107,7 @@ function parseHorizontal2025Sheet(workbook) {
   for (let r = dataStartRow; r <= range.e.r + 1; r++) {
     const 날짜 = formatDate(getCellValue(ws, `A${r}`));
     const 품목 = normalizeText(getCellValue(ws, `B${r}`));
+
     if (!날짜 && !품목) continue;
 
     branchBlocks.forEach((block) => {
@@ -197,6 +194,7 @@ function validateMainColumns(rows) {
 
 function validateStockColumns(rows, sheetName) {
   if (!rows.length) return [];
+
   const first = rows[0] || {};
   const cols = Object.keys(first);
   const errors = [];
@@ -393,6 +391,9 @@ function processWorkbook(workbook) {
     const da = normalizeText(a["날짜"]);
     const db = normalizeText(b["날짜"]);
     if (da !== db) return da.localeCompare(db);
+    if (normalizeText(a["지점명"]) !== normalizeText(b["지점명"])) {
+      return normalizeText(a["지점명"]).localeCompare(normalizeText(b["지점명"]));
+    }
     return normalizeText(a["품목"]).localeCompare(normalizeText(b["품목"]));
   });
 
@@ -559,6 +560,7 @@ function processWorkbook(workbook) {
 
 function renderIssues(result) {
   const container = document.getElementById("issues");
+  if (!container) return;
   container.innerHTML = "";
 
   const issues = [
@@ -601,6 +603,73 @@ function createTable(rows) {
   return html;
 }
 
+function populateBranchFilter(result) {
+  const select = document.getElementById("branchFilter");
+  if (!select) return;
+
+  const branches = new Set();
+
+  [...result.salesRows, ...result.discardRows].forEach((row) => {
+    if (row.지점명) branches.add(row.지점명);
+  });
+
+  const currentValue = select.value || "전체";
+  select.innerHTML = `<option value="전체">전체</option>`;
+
+  Array.from(branches).sort().forEach((branch) => {
+    const option = document.createElement("option");
+    option.value = branch;
+    option.textContent = branch;
+    select.appendChild(option);
+  });
+
+  select.value = Array.from(branches).includes(currentValue) ? currentValue : "전체";
+}
+
+function renderTables(result) {
+  const selectedBranch = document.getElementById("branchFilter")?.value || "전체";
+
+  const salesRows =
+    selectedBranch === "전체"
+      ? result.salesRows
+      : result.salesRows.filter((row) => row.지점명 === selectedBranch);
+
+  const discardRows =
+    selectedBranch === "전체"
+      ? result.discardRows
+      : result.discardRows.filter((row) => row.지점명 === selectedBranch);
+
+  const validationRows =
+    selectedBranch === "전체"
+      ? result.validationRows
+      : result.validationRows.filter((row) => row.지점명 === selectedBranch);
+
+  const mergedRows =
+    selectedBranch === "전체"
+      ? [...result.salesRows, ...result.discardRows]
+      : [...result.salesRows, ...result.discardRows].filter((row) => row.지점명 === selectedBranch);
+
+  const mergedTable = document.getElementById("mergedTable");
+  if (mergedTable) {
+    mergedTable.innerHTML = createTable(mergedRows);
+  }
+
+  const salesTable = document.getElementById("salesTable");
+  if (salesTable) {
+    salesTable.innerHTML = createTable(salesRows);
+  }
+
+  const discardTable = document.getElementById("discardTable");
+  if (discardTable) {
+    discardTable.innerHTML = createTable(discardRows);
+  }
+
+  const validationTable = document.getElementById("validationTable");
+  if (validationTable) {
+    validationTable.innerHTML = createTable(validationRows);
+  }
+}
+
 function updateStats(result) {
   document.getElementById("salesCount").textContent = result.salesRows.length;
   document.getElementById("discardCount").textContent = result.discardRows.length;
@@ -615,15 +684,11 @@ function updateStats(result) {
   document.getElementById("shortageCount").textContent = shortages;
 }
 
-function renderTables(result) {
-  document.getElementById("salesTable").innerHTML = createTable(result.salesRows);
-  document.getElementById("discardTable").innerHTML = createTable(result.discardRows);
-  document.getElementById("validationTable").innerHTML = createTable(result.validationRows);
-}
-
 function downloadWorkbook(result) {
   const wb = XLSX.utils.book_new();
 
+  const mergedRows = [...result.salesRows, ...result.discardRows];
+  const ws0 = XLSX.utils.json_to_sheet(mergedRows);
   const ws1 = XLSX.utils.json_to_sheet(result.salesRows);
   const ws2 = XLSX.utils.json_to_sheet(result.discardRows);
   const ws3 = XLSX.utils.json_to_sheet(result.validationRows);
@@ -634,6 +699,7 @@ function downloadWorkbook(result) {
   ];
   const ws4 = XLSX.utils.json_to_sheet(issueRows);
 
+  XLSX.utils.book_append_sheet(wb, ws0, "사용자동소진통합");
   XLSX.utils.book_append_sheet(wb, ws1, "판매자동소진");
   XLSX.utils.book_append_sheet(wb, ws2, "폐기자동소진");
   XLSX.utils.book_append_sheet(wb, ws3, "검증");
@@ -654,6 +720,7 @@ document.getElementById("fileInput").addEventListener("change", async (e) => {
 
     updateStats(result);
     renderIssues(result);
+    populateBranchFilter(result);
     renderTables(result);
 
     document.getElementById("downloadBtn").disabled = false;
@@ -665,4 +732,9 @@ document.getElementById("fileInput").addEventListener("change", async (e) => {
 document.getElementById("downloadBtn").addEventListener("click", () => {
   if (!latestResult) return;
   downloadWorkbook(latestResult);
+});
+
+document.getElementById("branchFilter")?.addEventListener("change", () => {
+  if (!latestResult) return;
+  renderTables(latestResult);
 });
