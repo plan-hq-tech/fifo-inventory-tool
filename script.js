@@ -115,7 +115,7 @@ function sortRowsByBusinessOrder(rows) {
  * - 판매수량
  * - 판매금액(사용명세서)
  * - 최종폐기
- * - 금액
+ * - 금액 (단, 최종폐기 뒤 첫 금액만 폐기금액으로 사용)
  * ========================= */
 function parseHorizontal2025Sheet(workbook) {
   const ws = workbook.Sheets[MAIN_SHEET];
@@ -131,10 +131,10 @@ function parseHorizontal2025Sheet(workbook) {
   const branchBlocks = [];
   let currentBranch = null;
 
-  const isSaleQty = (v) => ["판매수량"].includes(v);
-  const isSaleAmt = (v) => ["판매금액(사용명세서)"].includes(v);
-  const isDiscardQty = (v) => ["최종폐기"].includes(v);
-  const isDiscardAmt = (v) => ["금액"].includes(v);
+  const isSaleQty = (v) => v === "판매수량";
+  const isSaleAmt = (v) => v === "판매금액(사용명세서)";
+  const isDiscardQty = (v) => v === "최종폐기";
+  const isAmt = (v) => v === "금액";
 
   for (let c = 1; c <= range.e.c + 1; c++) {
     const col = numberToCol(c);
@@ -152,15 +152,36 @@ function parseHorizontal2025Sheet(workbook) {
         판매금액Col: null,
         폐기수량Col: null,
         폐기금액Col: null,
+        _waitingDiscardAmt: false,
       };
     }
 
     if (!currentBranch) continue;
 
-    if (isSaleQty(fieldName)) currentBranch.판매수량Col = col;
-    if (isSaleAmt(fieldName)) currentBranch.판매금액Col = col;
-    if (isDiscardQty(fieldName)) currentBranch.폐기수량Col = col;
-    if (isDiscardAmt(fieldName)) currentBranch.폐기금액Col = col;
+    if (isSaleQty(fieldName)) {
+      currentBranch.판매수량Col = col;
+      continue;
+    }
+
+    if (isSaleAmt(fieldName)) {
+      currentBranch.판매금액Col = col;
+      continue;
+    }
+
+    if (isDiscardQty(fieldName)) {
+      currentBranch.폐기수량Col = col;
+      currentBranch._waitingDiscardAmt = true;
+      continue;
+    }
+
+    // 중요:
+    // "금액"은 지점 블록 안에서 여러 번 등장할 수 있으므로
+    // 반드시 "최종폐기"를 찾은 뒤에 처음 등장하는 금액만 폐기금액으로 사용
+    if (isAmt(fieldName) && currentBranch._waitingDiscardAmt && !currentBranch.폐기금액Col) {
+      currentBranch.폐기금액Col = col;
+      currentBranch._waitingDiscardAmt = false;
+      continue;
+    }
   }
 
   if (currentBranch && currentBranch.지점명 && currentBranch.판매수량Col) {
@@ -317,7 +338,7 @@ function validateAnomalies(mainRows) {
 /* =========================
  * 재고 맵 생성
  * 당해 재고는 별도 DB가 없으므로 기본 0
- * 부족은 전전년+전년(+당해가 있다면 당해) 다 쓰고 남을 때만
+ * 부족은 전전년+전년+당해를 다 써도 남을 때만
  * ========================= */
 function buildOpeningStocks(prev2Rows, prevRows) {
   const result = new Map();
@@ -383,7 +404,6 @@ function allocateQuantityFIFO(totalQty, layers) {
   useLayer("전년", layers.전년수량);
   useLayer("당해", layers.당해수량);
 
-  // 세 연차를 다 사용하고도 남는 경우만 부족
   output.부족수량 = remainQty;
   return output;
 }
@@ -409,7 +429,6 @@ function allocateAmountFIFO(totalAmt, layers) {
   useLayer("전년", layers.전년금액);
   useLayer("당해", layers.당해금액);
 
-  // 세 연차를 다 사용하고도 남는 경우만 부족
   output.부족금액 = remainAmt;
   return output;
 }
@@ -452,6 +471,7 @@ function createDailyCombinedRow(branch, date, item) {
 
 /* =========================
  * 메인 처리
+ * 부족은 재고를 다 쓰고도 남을 때만
  * ========================= */
 function processWorkbook(workbook) {
   const mainRows = parseHorizontal2025Sheet(workbook);
