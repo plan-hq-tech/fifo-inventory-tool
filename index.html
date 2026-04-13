@@ -14,7 +14,14 @@
       엑셀 파일을 업로드하면 2025, 전년재고_DB, 전전년재고_DB 시트를 읽어
       FIFO(전전년 → 전년 → 당해) 기준으로 판매/폐기 자동소진 결과를 생성합니다.
     </p>
-
+    
+<div class="card">
+  <label for="branchFilter" class="label">지점 필터</label>
+  <select id="branchFilter">
+    <option value="전체">전체</option>
+  </select>
+</div>
+    
     <div class="card">
       <label for="fileInput" class="label">엑셀 파일 업로드</label>
       <input type="file" id="fileInput" accept=".xlsx,.xls" />
