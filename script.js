@@ -50,12 +50,117 @@ function parseSheet(workbook, sheetName) {
   if (!ws) throw new Error(`시트 '${sheetName}' 을(를) 찾을 수 없습니다.`);
   return XLSX.utils.sheet_to_json(ws, { defval: "" });
 }
+function getCellValue(ws, addr) {
+  return ws[addr] ? ws[addr].v : "";
+}
+
+function numberToCol(num) {
+  let col = "";
+  while (num > 0) {
+    const rem = (num - 1) % 26;
+    col = String.fromCharCode(65 + rem) + col;
+    num = Math.floor((num - 1) / 26);
+  }
+  return col;
+}
+
+function normalizeHeaderText(v) {
+  return String(v ?? "").replace(/\s+/g, "").trim();
+}
+
+function parseHorizontal2025Sheet(workbook) {
+  const ws = workbook.Sheets[MAIN_SHEET];
+  if (!ws) throw new Error(`시트 '${MAIN_SHEET}' 을(를) 찾을 수 없습니다.`);
+
+  const range = XLSX.utils.decode_range(ws["!ref"]);
+  const headerRowBranch = 9;
+  const headerRowField = 10;
+  const dataStartRow = 11;
+
+  const rows = [];
+  const branchBlocks = [];
+
+  // 9행 = 지점명 / 10행 = 항목명
+  for (let c = 1; c <= range.e.c + 1; c++) {
+    const col = numberToCol(c);
+    const branchName = normalizeText(getCellValue(ws, `${col}${headerRowBranch}`));
+    const fieldName = normalizeHeaderText(getCellValue(ws, `${col}${headerRowField}`));
+
+    if (branchName && fieldName === "판매수량") {
+      const block = {
+        지점명: branchName,
+        판매수량Col: col,
+        판매금액Col: null,
+        폐기수량Col: null,
+        폐기금액Col: null,
+      };
+
+      for (let c2 = c; c2 <= range.e.c + 1; c2++) {
+        const col2 = numberToCol(c2);
+        const branch2 = normalizeText(getCellValue(ws, `${col2}${headerRowBranch}`));
+        const field2 = normalizeHeaderText(getCellValue(ws, `${col2}${headerRowField}`));
+
+        if (c2 > c && branch2 && field2 === "판매수량") {
+          break;
+        }
+
+        if (field2 === "판매수량") block.판매수량Col = col2;
+        if (field2 === "판매금액") block.판매금액Col = col2;
+        if (field2 === "폐기수량" || field2 === "최종폐기") block.폐기수량Col = col2;
+        if (field2 === "폐기금액") block.폐기금액Col = col2;
+      }
+
+      branchBlocks.push(block);
+    }
+  }
+
+  if (!branchBlocks.length) {
+    throw new Error("2025 시트에서 지점 블록을 찾지 못했습니다. 9행=지점명, 10행=판매수량/판매금액/폐기수량/폐기금액 구조인지 확인해주세요.");
+  }
+
+  for (let r = dataStartRow; r <= range.e.r + 1; r++) {
+    const dateValue = getCellValue(ws, `A${r}`);
+    const itemValue = getCellValue(ws, `B${r}`);
+
+    const 날짜 = formatDate(dateValue);
+    const 품목 = normalizeText(itemValue);
+
+    if (!날짜 && !품목) continue;
+
+    branchBlocks.forEach((block) => {
+      const 판매수량 = toNumber(getCellValue(ws, `${block.판매수량Col}${r}`));
+      const 판매금액 = toNumber(getCellValue(ws, `${block.판매금액Col}${r}`));
+      const 폐기수량 = block.폐기수량Col ? toNumber(getCellValue(ws, `${block.폐기수량Col}${r}`)) : 0;
+      const 폐기금액 = block.폐기금액Col ? toNumber(getCellValue(ws, `${block.폐기금액Col}${r}`)) : 0;
+
+      if (판매수량 === 0 && 판매금액 === 0 && 폐기수량 === 0 && 폐기금액 === 0) {
+        return;
+      }
+
+      rows.push({
+        지점명: block.지점명,
+        날짜,
+        품목,
+        판매수량,
+        판매금액,
+        최종폐기: 폐기수량,
+        폐기금액,
+      });
+    });
+  }
+
+  return rows;
+}
 
 function validateMainColumns(rows) {
-  if (!rows.length) return [`${MAIN_SHEET} 시트에 데이터가 없습니다.`];
+  if (!rows.length) return [`${MAIN_SHEET} 시트에서 변환된 사용 데이터가 없습니다.`];
+
   const first = rows[0] || {};
   const cols = Object.keys(first);
-  return REQUIRED_MAIN_COLUMNS.filter((c) => !cols.includes(c)).map((c) => `${MAIN_SHEET} 시트 필수 컬럼 누락: ${c}`);
+
+  return REQUIRED_MAIN_COLUMNS
+    .filter((c) => !cols.includes(c))
+    .map((c) => `${MAIN_SHEET} 변환 데이터 필수 컬럼 누락: ${c}`);
 }
 
 function validateStockColumns(rows, sheetName) {
@@ -222,7 +327,7 @@ function allocateByFIFO(totalQty, totalAmt, layers) {
 }
 
 function processWorkbook(workbook) {
-  const mainRows = parseSheet(workbook, MAIN_SHEET);
+  const mainRows = parseHorizontal2025Sheet(workbook);
   const prevRows = parseSheet(workbook, PREV_SHEET);
   const prev2Rows = parseSheet(workbook, PREV2_SHEET);
 
