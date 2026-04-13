@@ -16,11 +16,16 @@ const ITEM_ORDER = [
 
 let latestResult = null;
 
+/* =========================
+ * 공통 유틸
+ * ========================= */
 function toNumber(v) {
   if (v === null || v === undefined || v === "") return 0;
   if (typeof v === "number") return Number.isFinite(v) ? v : 0;
+
   const cleaned = String(v).replace(/,/g, "").trim();
   if (cleaned === "-" || cleaned === "—") return 0;
+
   const n = Number(cleaned);
   return Number.isFinite(n) ? n : 0;
 }
@@ -36,11 +41,13 @@ function normalizeHeaderText(v) {
 function excelDateToJS(value) {
   if (!value) return null;
   if (value instanceof Date) return value;
+
   if (typeof value === "number") {
     const utcDays = Math.floor(value - 25569);
     const utcValue = utcDays * 86400;
     return new Date(utcValue * 1000);
   }
+
   const d = new Date(value);
   return Number.isNaN(d.getTime()) ? null : d;
 }
@@ -48,6 +55,7 @@ function excelDateToJS(value) {
 function formatDate(value) {
   const d = excelDateToJS(value);
   if (!d) return normalizeText(value);
+
   const yyyy = d.getFullYear();
   const mm = String(d.getMonth() + 1).padStart(2, "0");
   const dd = String(d.getDate()).padStart(2, "0");
@@ -96,6 +104,18 @@ function sortRowsByBusinessOrder(rows) {
   return [...rows].sort(compareRowsByBusinessOrder);
 }
 
+/* =========================
+ * 2025 시트(가로형) 파싱
+ * A열=날짜, B열=품목
+ * 9행=지점명
+ * 10행=항목명
+ *
+ * 읽을 항목명:
+ * - 판매수량
+ * - 판매금액(사용명세서)
+ * - 최종폐기
+ * - 금액
+ * ========================= */
 function parseHorizontal2025Sheet(workbook) {
   const ws = workbook.Sheets[MAIN_SHEET];
   if (!ws) throw new Error(`시트 '${MAIN_SHEET}' 을(를) 찾을 수 없습니다.`);
@@ -110,12 +130,17 @@ function parseHorizontal2025Sheet(workbook) {
   const branchBlocks = [];
   let currentBranch = null;
 
-  // 9행/10행 전체를 훑어서 지점 블록 구성
+  const isSaleQty = (v) => ["판매수량"].includes(v);
+  const isSaleAmt = (v) => ["판매금액(사용명세서)"].includes(v);
+  const isDiscardQty = (v) => ["최종폐기"].includes(v);
+  const isDiscardAmt = (v) => ["금액"].includes(v);
+
   for (let c = 1; c <= range.e.c + 1; c++) {
     const col = numberToCol(c);
     const branchName = normalizeText(getCellValue(ws, `${col}${headerRowBranch}`));
     const fieldName = normalizeHeaderText(getCellValue(ws, `${col}${headerRowField}`));
 
+    // 9행에 지점명이 나오면 새 블록 시작
     if (branchName) {
       if (currentBranch && currentBranch.지점명 && currentBranch.판매수량Col) {
         branchBlocks.push(currentBranch);
@@ -132,22 +157,30 @@ function parseHorizontal2025Sheet(workbook) {
 
     if (!currentBranch) continue;
 
-    if (fieldName === "판매수량") currentBranch.판매수량Col = col;
-    if (fieldName === "판매금액") currentBranch.판매금액Col = col;
-    if (fieldName === "폐기수량" || fieldName === "최종폐기") currentBranch.폐기수량Col = col;
-    if (fieldName === "폐기금액") currentBranch.폐기금액Col = col;
+    if (isSaleQty(fieldName)) currentBranch.판매수량Col = col;
+    if (isSaleAmt(fieldName)) currentBranch.판매금액Col = col;
+    if (isDiscardQty(fieldName)) currentBranch.폐기수량Col = col;
+    if (isDiscardAmt(fieldName)) currentBranch.폐기금액Col = col;
   }
 
   if (currentBranch && currentBranch.지점명 && currentBranch.판매수량Col) {
     branchBlocks.push(currentBranch);
   }
 
+  // 판매수량, 판매금액, 폐기수량, 폐기금액 4개가 모두 있는 블록만 사용
   const validBranchBlocks = branchBlocks.filter(
-    (b) => b.지점명 && b.판매수량Col && b.판매금액Col && b.폐기수량Col && b.폐기금액Col
+    (b) =>
+      b.지점명 &&
+      b.판매수량Col &&
+      b.판매금액Col &&
+      b.폐기수량Col &&
+      b.폐기금액Col
   );
 
   if (!validBranchBlocks.length) {
-    throw new Error("2025 시트에서 유효한 지점 블록을 찾지 못했습니다. 9행 지점명, 10행 판매수량/판매금액/폐기수량/폐기금액 구조를 확인해주세요.");
+    throw new Error(
+      "2025 시트에서 유효한 지점 블록을 찾지 못했습니다. 9행 지점명, 10행에 판매수량 / 판매금액(사용명세서) / 최종폐기 / 금액 구조인지 확인해주세요."
+    );
   }
 
   for (let r = dataStartRow; r <= range.e.r + 1; r++) {
@@ -179,6 +212,10 @@ function parseHorizontal2025Sheet(workbook) {
   return sortRowsByBusinessOrder(rows);
 }
 
+/* =========================
+ * 재고 시트 파싱 (A:E 고정)
+ * A=지점명, B=품목, C=일자, D=수량, E=금액
+ * ========================= */
 function parseInventorySheetFixed(workbook, sheetName) {
   const ws = workbook.Sheets[sheetName];
   if (!ws || !ws["!ref"]) return [];
@@ -188,6 +225,7 @@ function parseInventorySheetFixed(workbook, sheetName) {
 
   const rows = [];
 
+  // 1행 헤더, 2행부터 데이터
   for (let i = 1; i < sheet.length; i++) {
     const row = sheet[i] || [];
 
@@ -198,7 +236,12 @@ function parseInventorySheetFixed(workbook, sheetName) {
 
     if (!지점명 && !품목 && 수량 === 0 && 금액 === 0) continue;
 
-    rows.push({ 지점명, 품목, 수량, 금액 });
+    rows.push({
+      지점명,
+      품목,
+      수량,
+      금액,
+    });
   }
 
   return rows.sort((a, b) => {
@@ -214,6 +257,9 @@ function parseInventorySheetFixed(workbook, sheetName) {
   });
 }
 
+/* =========================
+ * 검증
+ * ========================= */
 function validateMainColumns(rows) {
   if (!rows.length) return [`${MAIN_SHEET} 시트에서 변환된 사용 데이터가 없습니다.`];
 
@@ -227,6 +273,7 @@ function validateMainColumns(rows) {
 
 function validateStockColumns(rows, sheetName) {
   if (!rows.length) return [];
+
   const first = rows[0] || {};
   const cols = Object.keys(first);
   const errors = [];
@@ -239,6 +286,47 @@ function validateStockColumns(rows, sheetName) {
   return errors;
 }
 
+function validateAnomalies(mainRows) {
+  const issues = [];
+
+  mainRows.forEach((row, idx) => {
+    const rowNo = idx + 1;
+    const saleQty = toNumber(row["판매수량"]);
+    const saleAmt = toNumber(row["판매금액"]);
+    const discardQty = toNumber(row["최종폐기"]);
+    const discardAmt = toNumber(row["폐기금액"]);
+
+    // 판매 수량/금액 쌍 검증
+    if (saleQty > 0 && saleAmt === 0) {
+      issues.push({ type: "이상치", message: `행 ${rowNo}: 판매수량이 있는데 판매금액이 0입니다.` });
+    }
+
+    if (saleQty === 0 && saleAmt > 0) {
+      issues.push({ type: "이상치", message: `행 ${rowNo}: 판매금액이 있는데 판매수량이 0입니다.` });
+    }
+
+    // 폐기 수량/금액 쌍 검증
+    if (discardQty > 0 && discardAmt === 0) {
+      issues.push({ type: "이상치", message: `행 ${rowNo}: 폐기수량이 있는데 폐기금액이 0입니다.` });
+    }
+
+    if (discardQty === 0 && discardAmt > 0) {
+      issues.push({ type: "이상치", message: `행 ${rowNo}: 폐기금액이 있는데 폐기수량이 0입니다.` });
+    }
+
+    if (saleQty < 0 || saleAmt < 0 || discardQty < 0 || discardAmt < 0) {
+      issues.push({ type: "음수값", message: `행 ${rowNo}: 음수값이 존재합니다.` });
+    }
+  });
+
+  return issues;
+}
+
+/* =========================
+ * FIFO
+ * - 재고가 있으면 최대한 먼저 사용
+ * - 전전년 -> 전년 -> 당해
+ * ========================= */
 function buildOpeningStocks(prev2Rows, prevRows) {
   const result = new Map();
 
@@ -326,40 +414,6 @@ function enrichWithCurrentYear(openingStocks, currentInputs) {
   return openingStocks;
 }
 
-function validateAnomalies(mainRows) {
-  const issues = [];
-
-  mainRows.forEach((row, idx) => {
-    const rowNo = idx + 1;
-    const saleQty = toNumber(row["판매수량"]);
-    const saleAmt = toNumber(row["판매금액"]);
-    const discardQty = toNumber(row["최종폐기"]);
-    const discardAmt = toNumber(row["폐기금액"]);
-
-    if (saleQty > 0 && saleAmt === 0) {
-      issues.push({ type: "이상치", message: `행 ${rowNo}: 판매수량이 있는데 판매금액이 0입니다.` });
-    }
-
-    if (saleQty === 0 && saleAmt > 0) {
-      issues.push({ type: "이상치", message: `행 ${rowNo}: 판매금액이 있는데 판매수량이 0입니다.` });
-    }
-
-    if (discardQty > 0 && discardAmt === 0) {
-      issues.push({ type: "이상치", message: `행 ${rowNo}: 폐기수량이 있는데 폐기금액이 0입니다.` });
-    }
-
-    if (discardQty === 0 && discardAmt > 0) {
-      issues.push({ type: "이상치", message: `행 ${rowNo}: 폐기금액이 있는데 폐기수량이 0입니다.` });
-    }
-
-    if (saleQty < 0 || saleAmt < 0 || discardQty < 0 || discardAmt < 0) {
-      issues.push({ type: "음수값", message: `행 ${rowNo}: 음수값이 존재합니다.` });
-    }
-  });
-
-  return issues;
-}
-
 function allocateQuantityFIFO(totalQty, layers) {
   let remainQty = toNumber(totalQty);
 
@@ -410,11 +464,15 @@ function allocateAmountFIFO(totalAmt, layers) {
   return output;
 }
 
+/* =========================
+ * 결과 행 생성
+ * ========================= */
 function createDailyCombinedRow(branch, date, item) {
   return {
     지점명: branch,
     일자: date,
     품목군: item,
+
     판매수량: 0,
     판매금액: 0,
     폐기수량: 0,
@@ -442,6 +500,9 @@ function createDailyCombinedRow(branch, date, item) {
   };
 }
 
+/* =========================
+ * 메인 처리
+ * ========================= */
 function processWorkbook(workbook) {
   const mainRows = parseHorizontal2025Sheet(workbook);
   const prevRows = parseInventorySheetFixed(workbook, PREV_SHEET);
@@ -631,6 +692,9 @@ function processWorkbook(workbook) {
   };
 }
 
+/* =========================
+ * 화면 표시
+ * ========================= */
 function renderIssues(result) {
   const container = document.getElementById("issues");
   if (!container) return;
@@ -755,6 +819,9 @@ function updateStats(result) {
   document.getElementById("shortageCount").textContent = shortages;
 }
 
+/* =========================
+ * 다운로드
+ * ========================= */
 function downloadWorkbook(result) {
   const wb = XLSX.utils.book_new();
 
@@ -778,6 +845,9 @@ function downloadWorkbook(result) {
   XLSX.writeFile(wb, "FIFO_자동소진_결과.xlsx");
 }
 
+/* =========================
+ * 이벤트
+ * ========================= */
 document.getElementById("fileInput").addEventListener("change", async (e) => {
   const file = e.target.files[0];
   if (!file) return;
