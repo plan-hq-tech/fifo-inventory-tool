@@ -3,9 +3,6 @@ const PREV_SHEET = "전년재고_DB";
 const PREV2_SHEET = "전전년재고_DB";
 
 const REQUIRED_MAIN_COLUMNS = ["지점명", "날짜", "품목", "판매수량", "판매금액", "최종폐기"];
-const STOCK_CANDIDATE_QTY = ["수량", "재고수량", "이월수량", "잔량"];
-const STOCK_CANDIDATE_AMT = ["금액", "재고금액", "이월금액", "잔액"];
-
 let latestResult = null;
 
 function toNumber(v) {
@@ -41,27 +38,6 @@ function formatDate(value) {
   return `${yyyy}-${mm}-${dd}`;
 }
 
-function findFirstColumn(row, candidates) {
-  return candidates.find((key) => Object.prototype.hasOwnProperty.call(row, key));
-}
-
-function parseSheet(workbook, sheetName, allowEmpty = false) {
-  const ws = workbook.Sheets[sheetName];
-
-  if (!ws) {
-    if (allowEmpty) return [];
-    throw new Error(`시트 '${sheetName}' 을(를) 찾을 수 없습니다.`);
-  }
-
-  const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
-
-  if (!rows.length && allowEmpty) {
-    return [];
-  }
-
-  return rows;
-}
-
 function getCellValue(ws, addr) {
   return ws[addr] ? ws[addr].v : "";
 }
@@ -78,6 +54,10 @@ function numberToCol(num) {
 
 function normalizeHeaderText(v) {
   return String(v ?? "").replace(/\s+/g, "").trim();
+}
+
+function findFirstColumn(row, candidates) {
+  return candidates.find((key) => Object.prototype.hasOwnProperty.call(row, key));
 }
 
 function parseHorizontal2025Sheet(workbook) {
@@ -112,9 +92,7 @@ function parseHorizontal2025Sheet(workbook) {
         const branch2 = normalizeText(getCellValue(ws, `${col2}${headerRowBranch}`));
         const field2 = normalizeHeaderText(getCellValue(ws, `${col2}${headerRowField}`));
 
-        if (c2 > c && branch2 && field2 === "판매수량") {
-          break;
-        }
+        if (c2 > c && branch2 && field2 === "판매수량") break;
 
         if (field2 === "판매수량") block.판매수량Col = col2;
         if (field2 === "판매금액") block.판매금액Col = col2;
@@ -131,12 +109,8 @@ function parseHorizontal2025Sheet(workbook) {
   }
 
   for (let r = dataStartRow; r <= range.e.r + 1; r++) {
-    const dateValue = getCellValue(ws, `A${r}`);
-    const itemValue = getCellValue(ws, `B${r}`);
-
-    const 날짜 = formatDate(dateValue);
-    const 품목 = normalizeText(itemValue);
-
+    const 날짜 = formatDate(getCellValue(ws, `A${r}`));
+    const 품목 = normalizeText(getCellValue(ws, `B${r}`));
     if (!날짜 && !품목) continue;
 
     branchBlocks.forEach((block) => {
@@ -145,9 +119,7 @@ function parseHorizontal2025Sheet(workbook) {
       const 폐기수량 = block.폐기수량Col ? toNumber(getCellValue(ws, `${block.폐기수량Col}${r}`)) : 0;
       const 폐기금액 = block.폐기금액Col ? toNumber(getCellValue(ws, `${block.폐기금액Col}${r}`)) : 0;
 
-      if (판매수량 === 0 && 판매금액 === 0 && 폐기수량 === 0 && 폐기금액 === 0) {
-        return;
-      }
+      if (판매수량 === 0 && 판매금액 === 0 && 폐기수량 === 0 && 폐기금액 === 0) return;
 
       rows.push({
         지점명: block.지점명,
@@ -159,6 +131,54 @@ function parseHorizontal2025Sheet(workbook) {
         폐기금액,
       });
     });
+  }
+
+  return rows;
+}
+
+function parseInventorySheet(workbook, sheetName) {
+  const ws = workbook.Sheets[sheetName];
+  if (!ws || !ws["!ref"]) return [];
+
+  const sheet = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
+  if (!sheet.length) return [];
+
+  let headerRowIndex = -1;
+
+  for (let i = 0; i < Math.min(sheet.length, 10); i++) {
+    const row = (sheet[i] || []).map((x) => normalizeHeaderText(x));
+    const hasBranch = row.includes("지점명");
+    const hasItem = row.includes("품목");
+    const hasQty = row.includes("수량");
+    const hasAmt = row.includes("금액");
+
+    if (hasBranch && hasItem && hasQty && hasAmt) {
+      headerRowIndex = i;
+      break;
+    }
+  }
+
+  if (headerRowIndex === -1) return [];
+
+  const headerRow = sheet[headerRowIndex].map((x) => normalizeHeaderText(x));
+
+  const idxBranch = headerRow.indexOf("지점명");
+  const idxItem = headerRow.indexOf("품목");
+  const idxQty = headerRow.indexOf("수량");
+  const idxAmt = headerRow.indexOf("금액");
+
+  const rows = [];
+
+  for (let i = headerRowIndex + 1; i < sheet.length; i++) {
+    const row = sheet[i] || [];
+    const 지점명 = normalizeText(row[idxBranch]);
+    const 품목 = normalizeText(row[idxItem]);
+    const 수량 = toNumber(row[idxQty]);
+    const 금액 = toNumber(row[idxAmt]);
+
+    if (!지점명 && !품목 && 수량 === 0 && 금액 === 0) continue;
+
+    rows.push({ 지점명, 품목, 수량, 금액 });
   }
 
   return rows;
@@ -177,17 +197,14 @@ function validateMainColumns(rows) {
 
 function validateStockColumns(rows, sheetName) {
   if (!rows.length) return [];
-
   const first = rows[0] || {};
   const cols = Object.keys(first);
-  const qtyCol = STOCK_CANDIDATE_QTY.find((c) => cols.includes(c));
-  const amtCol = STOCK_CANDIDATE_AMT.find((c) => cols.includes(c));
   const errors = [];
 
   if (!cols.includes("지점명")) errors.push(`${sheetName} 시트 필수 컬럼 누락: 지점명`);
   if (!cols.includes("품목")) errors.push(`${sheetName} 시트 필수 컬럼 누락: 품목`);
-  if (!qtyCol) errors.push(`${sheetName} 시트 수량 컬럼을 찾을 수 없습니다.`);
-  if (!amtCol) errors.push(`${sheetName} 시트 금액 컬럼을 찾을 수 없습니다.`);
+  if (!cols.includes("수량")) errors.push(`${sheetName} 시트 수량 컬럼을 찾을 수 없습니다.`);
+  if (!cols.includes("금액")) errors.push(`${sheetName} 시트 금액 컬럼을 찾을 수 없습니다.`);
 
   return errors;
 }
@@ -196,16 +213,12 @@ function buildOpeningStocks(prev2Rows, prevRows) {
   const result = new Map();
 
   const ingest = (rows, yearType) => {
-    if (!rows.length) return;
-    const qtyCol = findFirstColumn(rows[0], STOCK_CANDIDATE_QTY);
-    const amtCol = findFirstColumn(rows[0], STOCK_CANDIDATE_AMT);
-
     rows.forEach((row) => {
       const branch = normalizeText(row["지점명"]);
       const item = normalizeText(row["품목"]);
       const key = `${branch}__${item}`;
-      const qty = toNumber(row[qtyCol]);
-      const amt = toNumber(row[amtCol]);
+      const qty = toNumber(row["수량"]);
+      const amt = toNumber(row["금액"]);
 
       if (!branch || !item) return;
 
@@ -251,9 +264,7 @@ function aggregateCurrentYearInputs(mainRows) {
 
     if (!branch || !item) return;
 
-    if (!map.has(key)) {
-      map.set(key, { qty: 0, amt: 0 });
-    }
+    if (!map.has(key)) map.set(key, { qty: 0, amt: 0 });
 
     const agg = map.get(key);
     agg.qty += saleQty;
@@ -348,8 +359,8 @@ function allocateByFIFO(totalQty, totalAmt, layers) {
 
 function processWorkbook(workbook) {
   const mainRows = parseHorizontal2025Sheet(workbook);
-  const prevRows = parseSheet(workbook, PREV_SHEET, true);
-  const prev2Rows = parseSheet(workbook, PREV2_SHEET, true);
+  const prevRows = parseInventorySheet(workbook, PREV_SHEET);
+  const prev2Rows = parseInventorySheet(workbook, PREV2_SHEET);
 
   const schemaErrors = [
     ...validateMainColumns(mainRows),
@@ -454,7 +465,7 @@ function processWorkbook(workbook) {
     }
 
     if (discardQty > 0 || discardAmtInput > 0) {
-      let qtyResult = allocateByFIFO(discardQty, 0, stock);
+      const qtyResult = allocateByFIFO(discardQty, 0, stock);
 
       let 전전년폐기금액 = 0;
       let 전년폐기금액 = 0;
@@ -489,9 +500,7 @@ function processWorkbook(workbook) {
           const targetTotalAmt = Math.round(usedQty * unitAmt);
           const allocatedAmt = 전전년폐기금액 + 전년폐기금액 + 당해폐기금액;
           const diff = targetTotalAmt - allocatedAmt;
-          if (diff !== 0) {
-            당해폐기금액 += diff;
-          }
+          if (diff !== 0) 당해폐기금액 += diff;
         }
       }
 
