@@ -433,7 +433,102 @@ function createDailyCombinedRow(branch, date, item) {
     부족금액: 0,
   };
 }
+function buildPrevInventoryMap(prevRows) {
+  const map = new Map();
 
+  prevRows.forEach((row) => {
+    const branch = normalizeText(row.지점명);
+    const item = normalizeText(row.품목);
+    const key = `${branch}__${item}`;
+
+    if (!branch || !item) return;
+
+    if (!map.has(key)) {
+      map.set(key, {
+        지점명: branch,
+        품목군: item,
+        전년재고수량: 0,
+        전년재고금액: 0,
+      });
+    }
+
+    const target = map.get(key);
+    target.전년재고수량 += toNumber(row.수량);
+    target.전년재고금액 += toNumber(row.금액);
+  });
+
+  return map;
+}
+
+function buildPrevYearRemainderRows(prevRows, mergedDailyRows) {
+  const prevInventoryMap = buildPrevInventoryMap(prevRows);
+  const prevUsageMap = new Map();
+
+  mergedDailyRows.forEach((row) => {
+    const branch = normalizeText(row.지점명);
+    const item = normalizeText(row.품목군);
+    const key = `${branch}__${item}`;
+
+    if (!prevUsageMap.has(key)) {
+      prevUsageMap.set(key, {
+        전년판매수량: 0,
+        전년판매금액: 0,
+        전년폐기수량: 0,
+        전년폐기금액: 0,
+      });
+    }
+
+    const usage = prevUsageMap.get(key);
+    usage.전년판매수량 += toNumber(row.전년_판매수량);
+    usage.전년판매금액 += toNumber(row.전년_판매금액);
+    usage.전년폐기수량 += toNumber(row.전년_폐기수량);
+    usage.전년폐기금액 += toNumber(row.전년_폐기금액);
+  });
+
+  const rows = [];
+
+  for (const [key, inv] of prevInventoryMap.entries()) {
+    const usage = prevUsageMap.get(key) || {
+      전년판매수량: 0,
+      전년판매금액: 0,
+      전년폐기수량: 0,
+      전년폐기금액: 0,
+    };
+
+    const 전년총사용수량 = usage.전년판매수량 + usage.전년폐기수량;
+    const 전년총사용금액 = usage.전년판매금액 + usage.전년폐기금액;
+
+    const 전년미소진수량 = Math.max(0, inv.전년재고수량 - 전년총사용수량);
+    const 전년미소진금액 = Math.max(0, inv.전년재고금액 - 전년총사용금액);
+
+    rows.push({
+      지점명: inv.지점명,
+      품목군: inv.품목군,
+      전년재고수량: inv.전년재고수량,
+      전년재고금액: inv.전년재고금액,
+      전년판매수량: usage.전년판매수량,
+      전년판매금액: usage.전년판매금액,
+      전년폐기수량: usage.전년폐기수량,
+      전년폐기금액: usage.전년폐기금액,
+      전년총사용수량,
+      전년총사용금액,
+      전년미소진수량,
+      전년미소진금액,
+    });
+  }
+
+  return rows.sort((a, b) => {
+    const ba = normalizeText(a.지점명);
+    const bb = normalizeText(b.지점명);
+    if (ba !== bb) return ba.localeCompare(bb);
+
+    const ia = itemOrderIndex(a.품목군);
+    const ib = itemOrderIndex(b.품목군);
+    if (ia !== ib) return ia - ib;
+
+    return normalizeText(a.품목군).localeCompare(normalizeText(b.품목군));
+  });
+}
 /* =========================
  * 메인 처리
  * ========================= */
@@ -593,7 +688,7 @@ function processWorkbook(workbook) {
   });
 
   const mergedDailyRows = sortRowsByBusinessOrder(Array.from(dailyMap.values()));
-
+  const prevYearRemainderRows = buildPrevYearRemainderRows(prevRows, mergedDailyRows);
   return {
     ok: true,
     schemaErrors: [],
@@ -602,6 +697,7 @@ function processWorkbook(workbook) {
     salesRows,
     discardRows,
     validationRows,
+    prevYearRemainderRows,
   };
 }
 
@@ -704,6 +800,16 @@ function renderTables(result) {
     selectedBranch === "전체"
       ? result.validationRows
       : result.validationRows.filter((row) => row.지점명 === selectedBranch);
+   
+  const prevYearRemainderRows =
+    selectedBranch === "전체"
+      ? result.prevYearRemainderRows
+      : result.prevYearRemainderRows.filter((row) => row.지점명 === selectedBranch);
+
+  const prevYearRemainderTable = document.getElementById("prevYearRemainderTable");
+  if (prevYearRemainderTable) {
+    prevYearRemainderTable.innerHTML = createTable(prevYearRemainderRows, 200);
+  }
 
   const mergedTable = document.getElementById("mergedTable");
   if (mergedTable) mergedTable.innerHTML = createTable(mergedDailyRows, 300);
@@ -742,6 +848,7 @@ function downloadWorkbook(result) {
   const ws1 = XLSX.utils.json_to_sheet(result.salesRows);
   const ws2 = XLSX.utils.json_to_sheet(result.discardRows);
   const ws3 = XLSX.utils.json_to_sheet(result.validationRows);
+  const ws5 = XLSX.utils.json_to_sheet(result.prevYearRemainderRows);
 
   const issueRows = [
     ...result.schemaErrors.map((msg) => ({ 유형: "스키마오류", 내용: msg })),
@@ -754,6 +861,7 @@ function downloadWorkbook(result) {
   XLSX.utils.book_append_sheet(wb, ws2, "폐기자동소진");
   XLSX.utils.book_append_sheet(wb, ws3, "검증");
   XLSX.utils.book_append_sheet(wb, ws4, "오류및이상치");
+  XLSX.utils.book_append_sheet(wb, ws5, "전년미소진현황");
 
   XLSX.writeFile(wb, "FIFO_자동소진_결과.xlsx");
 }
