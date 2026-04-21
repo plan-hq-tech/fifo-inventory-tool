@@ -348,17 +348,23 @@ function allocateQuantityFIFO(totalQty, layers) {
     부족수량: 0,
   };
 
-  const useLayer = (yearKey, qtyAvailable) => {
-    const usedQty = Math.min(remainQty, Math.max(0, qtyAvailable));
-    remainQty -= usedQty;
-    output[`${yearKey}수량`] += usedQty;
-  };
+  // 1. 전전년 사용
+  const prev2Use = Math.min(remainQty, Math.max(0, toNumber(layers.전전년수량)));
+  output.전전년수량 = prev2Use;
+  remainQty -= prev2Use;
 
-  useLayer("전전년", layers.전전년수량);
-  useLayer("전년", layers.전년수량);
-  useLayer("당해", layers.당해수량);
+  // 2. 전년 사용
+  const prevUse = Math.min(remainQty, Math.max(0, toNumber(layers.전년수량)));
+  output.전년수량 = prevUse;
+  remainQty -= prevUse;
 
-  output.부족수량 = remainQty;
+  // 3. 남은 건 전부 당해 사용으로 처리
+  output.당해수량 = remainQty;
+  remainQty = 0;
+
+  // 4. 부족은 없음
+  output.부족수량 = 0;
+
   return output;
 }
 
@@ -372,17 +378,23 @@ function allocateAmountFIFO(totalAmt, layers) {
     부족금액: 0,
   };
 
-  const useLayer = (yearKey, amtAvailable) => {
-    const usedAmt = Math.min(remainAmt, Math.max(0, amtAvailable));
-    remainAmt -= usedAmt;
-    output[`${yearKey}금액`] += usedAmt;
-  };
+  // 1. 전전년 사용
+  const prev2Use = Math.min(remainAmt, Math.max(0, toNumber(layers.전전년금액)));
+  output.전전년금액 = prev2Use;
+  remainAmt -= prev2Use;
 
-  useLayer("전전년", layers.전전년금액);
-  useLayer("전년", layers.전년금액);
-  useLayer("당해", layers.당해금액);
+  // 2. 전년 사용
+  const prevUse = Math.min(remainAmt, Math.max(0, toNumber(layers.전년금액)));
+  output.전년금액 = prevUse;
+  remainAmt -= prevUse;
 
-  output.부족금액 = remainAmt;
+  // 3. 남은 건 전부 당해 사용으로 처리
+  output.당해금액 = remainAmt;
+  remainAmt = 0;
+
+  // 4. 부족은 없음
+  output.부족금액 = 0;
+
   return output;
 }
 
