@@ -93,9 +93,9 @@ function compareRowsByBusinessOrder(a, b) {
   const ib = itemOrderIndex(b["품목군"] || b["품목"]);
   if (ia !== ib) return ia - ib;
 
-  const ta = normalizeText(a["품목군"] || a["품목"]);
-  const tb = normalizeText(b["품목군"] || b["품목"]);
-  return ta.localeCompare(tb);
+  return normalizeText(a["품목군"] || a["품목"]).localeCompare(
+    normalizeText(b["품목군"] || b["품목"])
+  );
 }
 
 function sortRowsByBusinessOrder(rows) {
@@ -104,6 +104,16 @@ function sortRowsByBusinessOrder(rows) {
 
 /* =========================
  * 2025 시트 파싱
+ * - A열 = 날짜
+ * - B열 = 품목
+ * - 9행 = 지점명
+ * - 10행 = 항목명
+ *
+ * 각 지점 블록에서 읽는 값:
+ * - 판매수량
+ * - 판매금액(사용명세서)
+ * - 최종폐기
+ * - 최종폐기 뒤 첫 번째 금액
  * ========================= */
 function parseHorizontal2025Sheet(workbook) {
   const ws = workbook.Sheets[MAIN_SHEET];
@@ -248,7 +258,7 @@ function parseInventorySheetFixed(workbook, sheetName) {
 }
 
 /* =========================
- * 검증
+ * 이상치 검증
  * ========================= */
 function validateAnomalies(mainRows) {
   const issues = [];
@@ -278,7 +288,7 @@ function validateAnomalies(mainRows) {
 }
 
 /* =========================
- * 재고 맵
+ * 재고 맵 생성
  * ========================= */
 function buildOpeningStocks(prev2Rows, prevRows) {
   const result = new Map();
@@ -325,8 +335,8 @@ function buildOpeningStocks(prev2Rows, prevRows) {
 }
 
 /* =========================
- * FIFO
- * 부족은 세 연차 다 쓴 뒤 남을 때만
+ * FIFO 배분
+ * 부족은 세 연차를 다 쓰고도 남을 때만
  * ========================= */
 function allocateQuantityFIFO(totalQty, layers) {
   let remainQty = toNumber(totalQty);
