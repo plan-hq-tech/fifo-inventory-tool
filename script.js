@@ -547,7 +547,8 @@ function buildPrevYearRemainderRows(prevRows, mergedDailyRows) {
  * 메인 처리
  * ========================= */
 function processWorkbook(workbook) {
-  const mainRows = parseHorizontal2025Sheet(workbook);
+  const rawMainRows = parseHorizontal2025Sheet(workbook);
+  const mainRows = filterRowsByCutoff(rawMainRows);
   const prevRows = parseInventorySheetFixed(workbook, PREV_SHEET);
   const prev2Rows = parseInventorySheetFixed(workbook, PREV2_SHEET);
 
