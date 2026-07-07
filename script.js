@@ -36,6 +36,20 @@ function normalizeHeaderText(v) {
   return String(v ?? "").replace(/\s+/g, "").trim();
 }
 
+function getCutoffDate() {
+  const input = document.getElementById("cutoffDate");
+  return input && input.value ? input.value : null;
+}
+
+function filterRowsByCutoff(rows) {
+  const cutoff = getCutoffDate();
+  if (!cutoff) return rows;
+
+  return rows.filter((row) => {
+    const date = normalizeText(row.날짜);
+    return date && date <= cutoff;
+  });
+}
 function excelDateToJS(value) {
   if (!value) return null;
   if (value instanceof Date) return value;
