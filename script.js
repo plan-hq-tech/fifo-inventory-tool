@@ -480,15 +480,36 @@ function distributeOneStockAmount(entries, yearKey, stockQty, stockAmt) {
 
   const usedQty = targets.reduce((sum, e) => sum + toNumber(e[qtyField]), 0);
 
-  const targetAmt =
+  let targetAmt =
     usedQty >= stockQty
       ? Math.round(stockAmt)
       : Math.round((stockAmt * usedQty) / stockQty);
 
+  // 핵심: 각 행의 남은 총금액을 초과해서 배분하지 않도록 제한
+  const totalAvailableAmt = targets.reduce((sum, e) => {
+    const alreadyAllocated =
+      toNumber(e.prev2Amt) +
+      toNumber(e.prevAmt) +
+      toNumber(e.currentAmt);
+
+    return sum + Math.max(0, Math.round(toNumber(e.amt)) - alreadyAllocated);
+  }, 0);
+
+  targetAmt = Math.min(targetAmt, totalAvailableAmt);
+
+  if (targetAmt <= 0) return;
+
   targets.forEach((e) => {
+    const alreadyAllocated =
+      toNumber(e.prev2Amt) +
+      toNumber(e.prevAmt) +
+      toNumber(e.currentAmt);
+
+    const availableAmt = Math.max(0, Math.round(toNumber(e.amt)) - alreadyAllocated);
     const exact = (targetAmt * toNumber(e[qtyField])) / usedQty;
+
     e[exactField] = exact;
-    e[amtField] = Math.floor(exact);
+    e[amtField] = Math.min(availableAmt, Math.floor(exact));
   });
 
   let assigned = targets.reduce((sum, e) => sum + toNumber(e[amtField]), 0);
@@ -502,9 +523,23 @@ function distributeOneStockAmount(entries, yearKey, stockQty, stockAmt) {
 
   let i = 0;
   while (remain > 0 && targets.length) {
-    targets[i % targets.length][amtField] += 1;
-    remain--;
+    const e = targets[i % targets.length];
+
+    const alreadyAllocated =
+      toNumber(e.prev2Amt) +
+      toNumber(e.prevAmt) +
+      toNumber(e.currentAmt);
+
+    const availableAmt = Math.max(0, Math.round(toNumber(e.amt)) - alreadyAllocated);
+
+    if (availableAmt > 0) {
+      e[amtField] += 1;
+      remain--;
+    }
+
     i++;
+
+    if (i > targets.length * 10 && remain > 0) break;
   }
 }
 
@@ -543,11 +578,13 @@ function allocateGroupPeriod(entries, stock) {
   distributeOneStockAmount(entries, "prev2", toNumber(stock?.전전년수량), toNumber(stock?.전전년금액));
   distributeOneStockAmount(entries, "prev", toNumber(stock?.전년수량), toNumber(stock?.전년금액));
 
-  entries.forEach((e) => {
-    e.currentAmt = Math.round(toNumber(e.amt)) - toNumber(e.prev2Amt) - toNumber(e.prevAmt);
-    e.shortageAmt = 0;
-  });
-}
+entries.forEach((e) => {
+  const totalAmt = Math.round(toNumber(e.amt));
+  const allocatedAmt = toNumber(e.prev2Amt) + toNumber(e.prevAmt);
+
+  e.currentAmt = Math.max(0, totalAmt - allocatedAmt);
+  e.shortageAmt = 0;
+});
 
 function createDailyCombinedRow(branch, date, item) {
   return {
