@@ -521,7 +521,7 @@ function parseLockedDetailRows(workbook, sheetName, type) {
   const ws = workbook.Sheets[sheetName];
   if (!ws || !ws["!ref"]) return [];
 
-  const rows = XLSX.utils.sheet_to_json(ws, { defval: "" }).map((r) => ({
+  return XLSX.utils.sheet_to_json(ws, { defval: "" }).map((r) => ({
     구분: normalizeText(r.구분) || `${type}_기존제출`,
     지점명: normalizeText(r.지점명),
     날짜: formatDate(r.날짜),
@@ -542,8 +542,6 @@ function parseLockedDetailRows(workbook, sheetName, type) {
     부족수량: 0,
     부족금액: 0,
   })).filter((r) => r.지점명 && r.날짜 && r.품목);
-
-  return normalizeLockedDetailRows(rows);
 }
 
 function buildLockedDetailDailyMap(workbook) {
@@ -991,6 +989,35 @@ function buildValidationRows(dailyRows) {
   });
 }
 
+function buildAllocationStockMap(stockMap, lockedWorkbook) {
+  const lockedUseMap = buildLockedUseMap(lockedWorkbook);
+  const allocationStockMap = new Map();
+
+  for (const [key, stock] of stockMap.entries()) {
+    const locked = lockedUseMap.get(key) || {};
+
+    const remainPrev2Qty = Math.max(
+      0,
+      Math.round(toNumber(stock.전전년수량) - toNumber(locked.prev2Qty))
+    );
+
+    const remainPrevQty = Math.max(
+      0,
+      Math.round(toNumber(stock.전년수량) - toNumber(locked.prevQty))
+    );
+
+    allocationStockMap.set(key, {
+      ...stock,
+
+      // 새 증가분 계산에는 기존 제출에서 이미 사용한 재고를 차감한 잔여수량만 사용
+      전전년수량: remainPrev2Qty,
+      전년수량: remainPrevQty,
+    });
+  }
+
+  return allocationStockMap;
+}
+
 function buildLockedUseMap(workbook) {
   const map = new Map();
   if (!workbook) return map;
@@ -1106,6 +1133,11 @@ function processWorkbook(workbook) {
   const prevRows = parseInventorySheetFixed(workbook, PREV_SHEET);
   const stockMap = buildOpeningStocks(prev2Rows, prevRows);
 
+  // 중요:
+  // 기존 제출파일에서 이미 사용한 전전년/전년 재고를 차감한 뒤
+  // 새 증가분에 대해서만 FIFO 계산한다.
+  const allocationStockMap = buildAllocationStockMap(stockMap, lockedWorkbook);
+
   const anomalyIssues = validateAnomalies(mainRows);
 
   const groupMap = new Map();
@@ -1152,8 +1184,8 @@ function processWorkbook(workbook) {
   });
 
   for (const [key, entries] of groupMap.entries()) {
-    allocateGroupPeriod(entries, stockMap.get(key));
-  }
+    allocateGroupPeriod(entries, allocationStockMap.get(key));
+}
 
   const mergedMap = new Map();
 
