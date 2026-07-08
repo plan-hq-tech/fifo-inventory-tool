@@ -357,6 +357,35 @@ function parseLockedDailyRows(workbook) {
   }));
 }
 
+function parseLockedDetailRows(workbook, sheetName, type) {
+  if (!workbook) return [];
+
+  const ws = workbook.Sheets[sheetName];
+  if (!ws || !ws["!ref"]) return [];
+
+  return XLSX.utils.sheet_to_json(ws, { defval: "" }).map((r) => ({
+    구분: normalizeText(r.구분) || `${type}_기존제출`,
+    지점명: normalizeText(r.지점명),
+    날짜: formatDate(r.날짜),
+    품목: normalizeText(r.품목),
+
+    총사용수량: toNumber(r.총사용수량),
+    총사용금액: toNumber(r.총사용금액),
+
+    전전년사용수량: toNumber(r.전전년사용수량),
+    전전년사용금액: toNumber(r.전전년사용금액),
+
+    전년사용수량: toNumber(r.전년사용수량),
+    전년사용금액: toNumber(r.전년사용금액),
+
+    당해사용수량: toNumber(r.당해사용수량),
+    당해사용금액: toNumber(r.당해사용금액),
+
+    부족수량: 0,
+    부족금액: 0,
+  }));
+}
+
 function buildLockedMap(lockedRows) {
   const map = new Map();
 
@@ -507,7 +536,6 @@ function allocateIntegerByCapacity(total, entries, capacityField, resultField, d
 
   const eligible = entries.filter((e) => {
     if (dateLimit && normalizeText(e.date) > dateLimit) return false;
-    if (e.isDeltaOnly) return false;
     return toNumber(e[capacityField]) > 0;
   });
 
@@ -949,11 +977,26 @@ function processWorkbook(workbook) {
   }
 
   const mergedMap = new Map();
-  mergeLockedRowsIntoMergedMap(mergedMap, lockedRows);
+mergeLockedRowsIntoMergedMap(mergedMap, lockedRows);
 
-  const salesRows = [];
-  const discardRows = [];
-  const validationRows = [];
+// 기존 제출파일의 상세 시트도 그대로 다시 가져와야 함
+const lockedSalesRows = parseLockedDetailRows(
+  lockedWorkbook,
+  "판매자동소진",
+  "판매"
+);
+
+const lockedDiscardRows = parseLockedDetailRows(
+  lockedWorkbook,
+  "폐기자동소진",
+  "폐기"
+);
+
+// 기존 제출분은 그대로 보존하고, 이후 증가분만 뒤에 추가
+const salesRows = [...lockedSalesRows];
+const discardRows = [...lockedDiscardRows];
+
+const validationRows = [];
 
   for (const entries of groupMap.values()) {
     entries.forEach((e) => {
