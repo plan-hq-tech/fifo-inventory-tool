@@ -801,7 +801,102 @@ function allocateGroupPeriod(entries, stock) {
   });
 
   // 4. 금액은 행 단위 총금액 안에서 수량 비율로 배분
-  distributeRowAmountByAllocatedQty(entries);
+distributeRowAmountByAllocatedQty(entries);
+
+// 5. 최종 안전 보정: 수량만 있거나 금액만 있는 연차 제거
+fixQtyAmountPair(entries);
+}
+
+function fixQtyAmountPair(entries) {
+  entries.forEach((e) => {
+    const totalAmt = Math.round(toNumber(e.amt));
+
+    const pairs = [
+      { qtyField: "prev2Qty", amtField: "prev2Amt", name: "전전년" },
+      { qtyField: "prevQty", amtField: "prevAmt", name: "전년" },
+      { qtyField: "currentQty", amtField: "currentAmt", name: "당해" },
+    ];
+
+    // 총금액이 0이면 금액을 만들 수 없으므로 모두 0 처리
+    // 이 경우는 원본 오류목록에서 잡히는 게 맞음
+    if (totalAmt <= 0) {
+      pairs.forEach((p) => {
+        e[p.amtField] = 0;
+      });
+      return;
+    }
+
+    const qtyPairs = pairs.filter((p) => toNumber(e[p.qtyField]) > 0);
+
+    if (!qtyPairs.length) {
+      pairs.forEach((p) => {
+        e[p.amtField] = 0;
+      });
+      return;
+    }
+
+    // 수량이 없는 연차의 금액은 무조건 0
+    pairs.forEach((p) => {
+      if (toNumber(e[p.qtyField]) <= 0) {
+        e[p.amtField] = 0;
+      }
+    });
+
+    // 수량이 있는 연차인데 금액이 0이면 최소 1원 보장
+    qtyPairs.forEach((p) => {
+      if (toNumber(e[p.amtField]) <= 0) {
+        e[p.amtField] = 1;
+      }
+    });
+
+    // 총금액과 배분금액 차이 보정
+    let allocated = pairs.reduce((sum, p) => sum + toNumber(e[p.amtField]), 0);
+    let diff = totalAmt - allocated;
+
+    if (diff > 0) {
+      // 남는 금액은 당해가 있으면 당해에 우선 더함
+      const receiver =
+        qtyPairs.find((p) => p.amtField === "currentAmt") ||
+        qtyPairs.find((p) => p.amtField === "prevAmt") ||
+        qtyPairs[0];
+
+      e[receiver.amtField] += diff;
+    }
+
+    if (diff < 0) {
+      // 초과 금액은 금액이 큰 연차부터 줄이되, 수량 있는 연차는 최소 1원 유지
+      let over = Math.abs(diff);
+
+      const reducers = [...qtyPairs].sort(
+        (a, b) => toNumber(e[b.amtField]) - toNumber(e[a.amtField])
+      );
+
+      for (const p of reducers) {
+        if (over <= 0) break;
+
+        const currentAmt = toNumber(e[p.amtField]);
+        const removable = Math.max(0, currentAmt - 1);
+        const cut = Math.min(removable, over);
+
+        e[p.amtField] = currentAmt - cut;
+        over -= cut;
+      }
+    }
+
+    // 최종 안전장치
+    pairs.forEach((p) => {
+      const qty = toNumber(e[p.qtyField]);
+      const amt = toNumber(e[p.amtField]);
+
+      if (qty <= 0) {
+        e[p.amtField] = 0;
+      }
+
+      if (qty > 0 && amt < 0) {
+        e[p.amtField] = 0;
+      }
+    });
+  });
 }
 
 /*************************************************
@@ -1191,6 +1286,42 @@ const validationRows = [];
       금액차이: row.총사용금액 - periodAmtSum,
       부족수량: row.부족수량,
       부족금액: row.부족금액,
+
+      전전년판매쌍오류:
+  (row.전전년_판매수량 > 0 && row.전전년_판매금액 <= 0) ||
+  (row.전전년_판매수량 <= 0 && row.전전년_판매금액 > 0)
+    ? "오류"
+    : "",
+
+전년판매쌍오류:
+  (row.전년_판매수량 > 0 && row.전년_판매금액 <= 0) ||
+  (row.전년_판매수량 <= 0 && row.전년_판매금액 > 0)
+    ? "오류"
+    : "",
+
+당해판매쌍오류:
+  (row.당해_판매수량 > 0 && row.당해_판매금액 <= 0) ||
+  (row.당해_판매수량 <= 0 && row.당해_판매금액 > 0)
+    ? "오류"
+    : "",
+
+전전년폐기쌍오류:
+  (row.전전년_폐기수량 > 0 && row.전전년_폐기금액 <= 0) ||
+  (row.전전년_폐기수량 <= 0 && row.전전년_폐기금액 > 0)
+    ? "오류"
+    : "",
+
+전년폐기쌍오류:
+  (row.전년_폐기수량 > 0 && row.전년_폐기금액 <= 0) ||
+  (row.전년_폐기수량 <= 0 && row.전년_폐기금액 > 0)
+    ? "오류"
+    : "",
+
+당해폐기쌍오류:
+  (row.당해_폐기수량 > 0 && row.당해_폐기금액 <= 0) ||
+  (row.당해_폐기수량 <= 0 && row.당해_폐기금액 > 0)
+    ? "오류"
+    : "",
     });
 
     return row;
