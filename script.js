@@ -785,6 +785,34 @@ function allocateIntegerByCapacity(total, entries, capacityField, resultField, d
   return target;
 }
 
+
+function allocateSequentialFIFO(entries, stockQty, resultField, dateLimit) {
+  let remainStock = Math.max(0, Math.round(toNumber(stockQty)));
+  let usedStock = 0;
+
+  if (remainStock <= 0) return 0;
+
+  for (const e of entries) {
+    if (dateLimit && normalizeText(e.date) > dateLimit) continue;
+    if (toNumber(e.remainQty) <= 0) continue;
+    if (remainStock <= 0) break;
+
+    const useQty = Math.min(
+      Math.round(toNumber(e.remainQty)),
+      remainStock
+    );
+
+    e[resultField] = toNumber(e[resultField]) + useQty;
+    e.remainQty = Math.round(toNumber(e.remainQty)) - useQty;
+
+    remainStock -= useQty;
+    usedStock += useQty;
+  }
+
+  return usedStock;
+}
+
+
 /*************************************************
  * 금액 배분
  * 중요:
@@ -804,32 +832,46 @@ function distributeRowAmountByAllocatedQty(entries) {
     e.shortageAmt = 0;
 
     const parts = [
-      { name: "전전년", qtyField: "prev2Qty", amtField: "prev2Amt", qty: toNumber(e.prev2Qty) },
-      { name: "전년", qtyField: "prevQty", amtField: "prevAmt", qty: toNumber(e.prevQty) },
-      { name: "당해", qtyField: "currentQty", amtField: "currentAmt", qty: toNumber(e.currentQty) },
+      {
+        name: "전전년",
+        qtyField: "prev2Qty",
+        amtField: "prev2Amt",
+        qty: Math.round(toNumber(e.prev2Qty)),
+      },
+      {
+        name: "전년",
+        qtyField: "prevQty",
+        amtField: "prevAmt",
+        qty: Math.round(toNumber(e.prevQty)),
+      },
+      {
+        name: "당해",
+        qtyField: "currentQty",
+        amtField: "currentAmt",
+        qty: Math.round(toNumber(e.currentQty)),
+      },
     ].filter((p) => p.qty > 0);
 
+    // 수량이 없으면 금액도 없음
     if (!parts.length) return;
 
-    if (totalAmt <= 0) {
-      e.shortageAmt = 0;
-      return;
-    }
+    // 총금액이 없으면 배분 불가
+    // 이 경우는 오류목록에서 잡히는 게 맞음
+    if (totalAmt <= 0) return;
 
+    // 수량 있는 연차가 하나뿐이면 총금액 전부 배정
     if (parts.length === 1) {
       e[parts[0].amtField] = totalAmt;
       return;
     }
 
-    const totalQty = parts.reduce((sum, p) => sum + p.qty, 0);
-
-    // 금액이 연차 개수보다 적으면 모든 연차에 1원 이상 줄 수 없음.
-    // 이 경우 최소 불일치를 피하기 위해 수량이 가장 큰 연차부터 금액을 배분.
+    // 총금액이 연차 수보다 작으면 모든 연차에 1원 보장 불가
+    // 그래도 수량 큰 순서대로 1원씩 배분
     if (totalAmt < parts.length) {
-      parts.sort((a, b) => b.qty - a.qty);
+      const sorted = [...parts].sort((a, b) => b.qty - a.qty);
       let remainSmall = totalAmt;
 
-      parts.forEach((p) => {
+      sorted.forEach((p) => {
         if (remainSmall > 0) {
           e[p.amtField] = 1;
           remainSmall -= 1;
@@ -839,20 +881,20 @@ function distributeRowAmountByAllocatedQty(entries) {
       return;
     }
 
-    // 1차: 수량 있는 연차에 최소 1원씩 보장
+    // 수량 있는 연차에 최소 1원 보장
     parts.forEach((p) => {
       e[p.amtField] = 1;
     });
 
-    let remain = totalAmt - parts.length;
+    let remainAmt = totalAmt - parts.length;
+    const totalQty = parts.reduce((sum, p) => sum + p.qty, 0);
 
     const temp = parts.map((p) => {
-      const exact = (remain * p.qty) / totalQty;
+      const exact = (remainAmt * p.qty) / totalQty;
       const base = Math.floor(exact);
 
       return {
         ...p,
-        exact,
         base,
         frac: exact - base,
       };
@@ -865,7 +907,7 @@ function distributeRowAmountByAllocatedQty(entries) {
       assigned += p.base;
     });
 
-    let leftover = remain - assigned;
+    let leftover = remainAmt - assigned;
 
     temp.sort((a, b) => b.frac - a.frac);
 
@@ -877,8 +919,10 @@ function distributeRowAmountByAllocatedQty(entries) {
       i += 1;
     }
 
-    // 최종 안전장치: 총금액과 배분금액 일치 보정
-    const allocated = toNumber(e.prev2Amt) + toNumber(e.prevAmt) + toNumber(e.currentAmt);
+    // 총금액 일치 보정
+    const allocated =
+      toNumber(e.prev2Amt) + toNumber(e.prevAmt) + toNumber(e.currentAmt);
+
     const diff = totalAmt - allocated;
 
     if (diff !== 0) {
@@ -890,16 +934,25 @@ function distributeRowAmountByAllocatedQty(entries) {
       e[receiver.amtField] += diff;
     }
 
-    // 최종 안전장치: 음수 방지
-    ["prev2Amt", "prevAmt", "currentAmt"].forEach((field) => {
-      if (e[field] < 0) e[field] = 0;
-    });
+    // 수량 없는 곳 금액 제거
+    if (toNumber(e.prev2Qty) <= 0) e.prev2Amt = 0;
+    if (toNumber(e.prevQty) <= 0) e.prevAmt = 0;
+    if (toNumber(e.currentQty) <= 0) e.currentAmt = 0;
   });
 }
 
 function allocateGroupPeriod(entries, stock) {
   const prev2Cutoff = getPrev2CutoffDate();
   const prevCutoff = getPrevCutoffDate();
+
+  // 날짜순 FIFO 정렬
+  entries.sort((a, b) => {
+    if (a.date !== b.date) return a.date.localeCompare(b.date);
+
+    // 같은 날짜에서는 판매를 먼저 처리하고 폐기를 나중에 처리
+    // 필요하면 반대로 바꿀 수 있음
+    return a.type.localeCompare(b.type);
+  });
 
   entries.forEach((e) => {
     e.remainQty = Math.round(toNumber(e.qty));
@@ -915,44 +968,35 @@ function allocateGroupPeriod(entries, stock) {
     e.shortageAmt = 0;
   });
 
-  // 1. 전전년 수량 배분
-  allocateIntegerByCapacity(
-    toNumber(stock?.전전년수량),
+  // 1. 전전년재고를 날짜순으로 먼저 소진
+  allocateSequentialFIFO(
     entries,
-    "remainQty",
+    toNumber(stock?.전전년수량),
     "prev2Qty",
     prev2Cutoff
   );
 
-  entries.forEach((e) => {
-    e.remainQty -= e.prev2Qty;
-  });
-
-  // 2. 전년 수량 배분
-  allocateIntegerByCapacity(
-    toNumber(stock?.전년수량),
+  // 2. 남은 수량에 대해 전년재고를 날짜순으로 소진
+  allocateSequentialFIFO(
     entries,
-    "remainQty",
+    toNumber(stock?.전년수량),
     "prevQty",
     prevCutoff
   );
 
+  // 3. 그래도 남은 수량은 부족이 아니라 당해 사용
   entries.forEach((e) => {
-    e.remainQty -= e.prevQty;
-  });
-
-  // 3. 남은 수량은 부족이 아니라 당해 사용
-  entries.forEach((e) => {
-    e.currentQty = Math.max(0, e.remainQty);
+    e.currentQty = Math.max(0, Math.round(toNumber(e.remainQty)));
     e.remainQty = 0;
     e.shortageQty = 0;
   });
 
-  // 4. 금액은 행 단위 총금액 안에서 수량 비율로 배분
-distributeRowAmountByAllocatedQty(entries);
+  // 4. 행 단위 총금액 안에서 연차별 수량 기준 금액 재배분
+  distributeRowAmountByAllocatedQty(entries);
 
-// 5. 최종 안전 보정: 수량만 있거나 금액만 있는 연차 제거
-fixQtyAmountPair(entries);
+  // 5. 최종 안전 보정
+  // 수량만 있거나 금액만 있는 연차를 방지
+  fixQtyAmountPair(entries);
 }
 
 function fixQtyAmountPair(entries) {
