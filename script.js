@@ -385,10 +385,72 @@ function allocateGroupPeriod(entries, stock) {
     e.shortageQty = Math.max(0, e.remainQty);
   });
 
-  distributeAmountsByAllocatedQty(entries, "prev2");
-  distributeAmountsByAllocatedQty(entries, "prev");
-  distributeAmountsByAllocatedQty(entries, "current");
-  fixAmountRemainder(entries, ["prev2", "prev", "current"]);
+distributeStockAmountsByPeriod(entries, stock); {
+  distributeOneStockAmount(
+    entries,
+    "prev2",
+    toNumber(stock?.전전년수량),
+    toNumber(stock?.전전년금액)
+  );
+
+  distributeOneStockAmount(
+    entries,
+    "prev",
+    toNumber(stock?.전년수량),
+    toNumber(stock?.전년금액)
+  );
+
+  entries.forEach((e) => {
+    e.currentAmt = Math.max(
+      0,
+      Math.round(toNumber(e.amt)) - toNumber(e.prev2Amt) - toNumber(e.prevAmt)
+    );
+    e.shortageAmt = 0;
+  });
+}
+
+function distributeOneStockAmount(entries, yearKey, stockQty, stockAmt) {
+  const qtyField = `${yearKey}Qty`;
+  const amtField = `${yearKey}Amt`;
+
+  const targets = entries.filter((e) => toNumber(e[qtyField]) > 0);
+
+  targets.forEach((e) => {
+    e[amtField] = 0;
+    e[`${amtField}Exact`] = 0;
+  });
+
+  if (!targets.length || stockQty <= 0 || stockAmt <= 0) return;
+
+  const usedQty = targets.reduce((sum, e) => sum + toNumber(e[qtyField]), 0);
+
+  const targetAmt =
+    usedQty >= stockQty
+      ? Math.round(stockAmt)
+      : Math.round((stockAmt * usedQty) / stockQty);
+
+  targets.forEach((e) => {
+    const exact = (targetAmt * toNumber(e[qtyField])) / usedQty;
+    e[`${amtField}Exact`] = exact;
+    e[amtField] = Math.floor(exact);
+  });
+
+  let assigned = targets.reduce((sum, e) => sum + toNumber(e[amtField]), 0);
+  let remain = targetAmt - assigned;
+
+  targets.sort((a, b) => {
+    const fa = a[`${amtField}Exact`] - Math.floor(a[`${amtField}Exact`]);
+    const fb = b[`${amtField}Exact`] - Math.floor(b[`${amtField}Exact`]);
+    return fb - fa;
+  });
+
+  let i = 0;
+  while (remain > 0 && targets.length) {
+    targets[i % targets.length][amtField] += 1;
+    remain--;
+    i++;
+  }
+}
 }
 
 function createDailyCombinedRow(branch, date, item) {
