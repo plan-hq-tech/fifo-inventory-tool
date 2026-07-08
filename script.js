@@ -547,17 +547,104 @@ function allocateGroupPeriod(entries, stock) {
     e.shortageAmt = 0;
   });
 
-  allocateIntegerByCapacity(toNumber(stock?.전전년수량), entries, "remainQty", "prev2Qty", prev2Cutoff);
-  entries.forEach((e) => (e.remainQty -= e.prev2Qty));
+  allocateIntegerByCapacity(
+    toNumber(stock?.전전년수량),
+    entries,
+    "remainQty",
+    "prev2Qty",
+    prev2Cutoff
+  );
 
-  allocateIntegerByCapacity(toNumber(stock?.전년수량), entries, "remainQty", "prevQty", prevCutoff);
-  entries.forEach((e) => (e.remainQty -= e.prevQty));
+  entries.forEach((e) => {
+    e.remainQty -= e.prev2Qty;
+  });
 
+  allocateIntegerByCapacity(
+    toNumber(stock?.전년수량),
+    entries,
+    "remainQty",
+    "prevQty",
+    prevCutoff
+  );
+
+  entries.forEach((e) => {
+    e.remainQty -= e.prevQty;
+  });
+
+  // 남은 수량은 부족이 아니라 당해 사용
   entries.forEach((e) => {
     e.currentQty = Math.max(0, e.remainQty);
     e.remainQty = 0;
     e.shortageQty = 0;
   });
+
+  // 핵심 수정: 한 행 안에서 수량 있는 연차에만 금액 배분
+  distributeRowAmountsWithoutMismatch(entries);
+}
+
+function distributeRowAmountsWithoutMismatch(entries) {
+  entries.forEach((e) => {
+    const totalAmt = Math.round(toNumber(e.amt));
+
+    e.prev2Amt = 0;
+    e.prevAmt = 0;
+    e.currentAmt = 0;
+    e.shortageAmt = 0;
+
+    const parts = [
+      { key: "prev2", qty: toNumber(e.prev2Qty), amtField: "prev2Amt" },
+      { key: "prev", qty: toNumber(e.prevQty), amtField: "prevAmt" },
+      { key: "current", qty: toNumber(e.currentQty), amtField: "currentAmt" },
+    ].filter((p) => p.qty > 0);
+
+    if (!parts.length || totalAmt <= 0) return;
+
+    if (parts.length === 1) {
+      e[parts[0].amtField] = totalAmt;
+      return;
+    }
+
+    const totalQty = parts.reduce((sum, p) => sum + p.qty, 0);
+
+    let assigned = 0;
+
+    parts.forEach((p) => {
+      const exact = (totalAmt * p.qty) / totalQty;
+      p.exact = exact;
+      p.base = Math.floor(exact);
+      e[p.amtField] = p.base;
+      assigned += p.base;
+    });
+
+    let remain = totalAmt - assigned;
+
+    parts.sort((a, b) => {
+      const fa = a.exact - Math.floor(a.exact);
+      const fb = b.exact - Math.floor(b.exact);
+      return fb - fa;
+    });
+
+    let i = 0;
+    while (remain > 0) {
+      const p = parts[i % parts.length];
+      e[p.amtField] += 1;
+      remain--;
+      i++;
+    }
+
+    // 최종 안전장치:
+    // 수량이 있는데 금액이 0인 경우, 다른 연차에서 1원 이동
+    parts.forEach((p) => {
+      if (p.qty > 0 && e[p.amtField] === 0 && totalAmt >= parts.length) {
+        const donor = parts.find((x) => e[x.amtField] > 1);
+        if (donor) {
+          e[donor.amtField] -= 1;
+          e[p.amtField] += 1;
+        }
+      }
+    });
+  });
+}
 
   distributeOneStockAmount(entries, "prev2", toNumber(stock?.전전년수량), toNumber(stock?.전전년금액));
   distributeOneStockAmount(entries, "prev", toNumber(stock?.전년수량), toNumber(stock?.전년금액));
@@ -734,33 +821,32 @@ function processWorkbook(workbook) {
     const saleQty = toNumber(row.판매수량);
     const saleAmt = toNumber(row.판매금액);
 
-    if (saleQty > 0 || saleAmt > 0) {
-      groupMap.get(key).push({
-        type: "판매",
-        branch,
-        item,
-        date,
-        qty: saleQty,
-        amt: saleAmt,
-        isDeltaOnly: !!row.isDeltaOnly,
-      });
-    }
+    if (saleQty > 0 && saleAmt > 0) {
+  groupMap.get(key).push({
+    type: "판매",
+    branch,
+    item,
+    date,
+    qty: saleQty,
+    amt: saleAmt,
+    isDeltaOnly: !!row.isDeltaOnly,
+  });
+}
 
     const discardQty = toNumber(row.최종폐기);
     const discardAmt = toNumber(row.폐기금액);
 
-    if (discardQty > 0 || discardAmt > 0) {
-      groupMap.get(key).push({
-        type: "폐기",
-        branch,
-        item,
-        date,
-        qty: discardQty,
-        amt: discardAmt,
-        isDeltaOnly: !!row.isDeltaOnly,
-      });
-    }
+    if (discardQty > 0 && discardAmt > 0) {
+  groupMap.get(key).push({
+    type: "폐기",
+    branch,
+    item,
+    date,
+    qty: discardQty,
+    amt: discardAmt,
+    isDeltaOnly: !!row.isDeltaOnly,
   });
+}
 
   for (const [key, entries] of groupMap.entries()) {
     entries.sort((a, b) => {
