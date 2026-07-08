@@ -45,8 +45,24 @@ function formatDate(value) {
   const yyyy = d.getFullYear();
   const mm = String(d.getMonth() + 1).padStart(2, "0");
   const dd = String(d.getDate()).padStart(2, "0");
-
   return `${yyyy}-${mm}-${dd}`;
+}
+
+function todayString() {
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function setDefaultTodayDates() {
+  const today = todayString();
+
+  ["prev2CutoffDate", "prevCutoffDate", "finalCutoffDate"].forEach((id) => {
+    const input = document.getElementById(id);
+    if (input && !input.value) input.value = today;
+  });
 }
 
 function getDateInput(id) {
@@ -103,9 +119,7 @@ function sortRowsByBusinessOrder(rows) {
     const ib = itemOrderIndex(b.품목군 || b.품목);
     if (ia !== ib) return ia - ib;
 
-    return normalizeText(a.품목군 || a.품목).localeCompare(
-      normalizeText(b.품목군 || b.품목)
-    );
+    return normalizeText(a.품목군 || a.품목).localeCompare(normalizeText(b.품목군 || b.품목));
   });
 }
 
@@ -341,7 +355,6 @@ function buildLockedMap(lockedRows) {
 
   lockedRows.forEach((r) => {
     const key = makeKey(r.지점명, r.일자, r.품목군);
-
     map.set(key, {
       판매수량: toNumber(r.판매수량),
       판매금액: toNumber(r.판매금액),
@@ -397,14 +410,7 @@ function buildDeltaRows(currentRows, lockedRows) {
     const deltaDiscardQty = Math.max(0, toNumber(r.최종폐기) - toNumber(locked.폐기수량));
     const deltaDiscardAmt = Math.max(0, toNumber(r.폐기금액) - toNumber(locked.폐기금액));
 
-    if (
-      deltaSaleQty === 0 &&
-      deltaSaleAmt === 0 &&
-      deltaDiscardQty === 0 &&
-      deltaDiscardAmt === 0
-    ) {
-      return;
-    }
+    if (deltaSaleQty === 0 && deltaSaleAmt === 0 && deltaDiscardQty === 0 && deltaDiscardAmt === 0) return;
 
     deltaRows.push({
       지점명: r.지점명,
@@ -430,11 +436,7 @@ function allocateIntegerByCapacity(total, entries, capacityField, resultField, d
     return toNumber(e[capacityField]) > 0;
   });
 
-  const totalCap = eligible.reduce(
-    (sum, e) => sum + Math.max(0, Math.round(toNumber(e[capacityField]))),
-    0
-  );
-
+  const totalCap = eligible.reduce((sum, e) => sum + Math.max(0, Math.round(toNumber(e[capacityField]))), 0);
   target = Math.min(target, totalCap);
 
   if (target <= 0 || totalCap <= 0) return 0;
@@ -485,26 +487,16 @@ function distributeOneStockAmount(entries, yearKey, stockQty, stockAmt) {
       ? Math.round(stockAmt)
       : Math.round((stockAmt * usedQty) / stockQty);
 
-  // 핵심: 각 행의 남은 총금액을 초과해서 배분하지 않도록 제한
   const totalAvailableAmt = targets.reduce((sum, e) => {
-    const alreadyAllocated =
-      toNumber(e.prev2Amt) +
-      toNumber(e.prevAmt) +
-      toNumber(e.currentAmt);
-
+    const alreadyAllocated = toNumber(e.prev2Amt) + toNumber(e.prevAmt) + toNumber(e.currentAmt);
     return sum + Math.max(0, Math.round(toNumber(e.amt)) - alreadyAllocated);
   }, 0);
 
   targetAmt = Math.min(targetAmt, totalAvailableAmt);
-
   if (targetAmt <= 0) return;
 
   targets.forEach((e) => {
-    const alreadyAllocated =
-      toNumber(e.prev2Amt) +
-      toNumber(e.prevAmt) +
-      toNumber(e.currentAmt);
-
+    const alreadyAllocated = toNumber(e.prev2Amt) + toNumber(e.prevAmt) + toNumber(e.currentAmt);
     const availableAmt = Math.max(0, Math.round(toNumber(e.amt)) - alreadyAllocated);
     const exact = (targetAmt * toNumber(e[qtyField])) / usedQty;
 
@@ -521,15 +513,11 @@ function distributeOneStockAmount(entries, yearKey, stockQty, stockAmt) {
     return fb - fa;
   });
 
-  let i = 0;
-  while (remain > 0 && targets.length) {
-    const e = targets[i % targets.length];
+  let guard = 0;
+  while (remain > 0 && targets.length && guard < targets.length * 20) {
+    const e = targets[guard % targets.length];
 
-    const alreadyAllocated =
-      toNumber(e.prev2Amt) +
-      toNumber(e.prevAmt) +
-      toNumber(e.currentAmt);
-
+    const alreadyAllocated = toNumber(e.prev2Amt) + toNumber(e.prevAmt) + toNumber(e.currentAmt);
     const availableAmt = Math.max(0, Math.round(toNumber(e.amt)) - alreadyAllocated);
 
     if (availableAmt > 0) {
@@ -537,9 +525,7 @@ function distributeOneStockAmount(entries, yearKey, stockQty, stockAmt) {
       remain--;
     }
 
-    i++;
-
-    if (i > targets.length * 10 && remain > 0) break;
+    guard++;
   }
 }
 
@@ -567,8 +553,6 @@ function allocateGroupPeriod(entries, stock) {
   allocateIntegerByCapacity(toNumber(stock?.전년수량), entries, "remainQty", "prevQty", prevCutoff);
   entries.forEach((e) => (e.remainQty -= e.prevQty));
 
-  // 핵심 수정:
-  // 전전년/전년으로 배분되지 않은 나머지는 부족이 아니라 당해 사용으로 처리
   entries.forEach((e) => {
     e.currentQty = Math.max(0, e.remainQty);
     e.remainQty = 0;
@@ -578,13 +562,14 @@ function allocateGroupPeriod(entries, stock) {
   distributeOneStockAmount(entries, "prev2", toNumber(stock?.전전년수량), toNumber(stock?.전전년금액));
   distributeOneStockAmount(entries, "prev", toNumber(stock?.전년수량), toNumber(stock?.전년금액));
 
-entries.forEach((e) => {
-  const totalAmt = Math.round(toNumber(e.amt));
-  const allocatedAmt = toNumber(e.prev2Amt) + toNumber(e.prevAmt);
+  entries.forEach((e) => {
+    const totalAmt = Math.round(toNumber(e.amt));
+    const allocatedAmt = toNumber(e.prev2Amt) + toNumber(e.prevAmt);
 
-  e.currentAmt = Math.max(0, totalAmt - allocatedAmt);
-  e.shortageAmt = 0;
-});
+    e.currentAmt = Math.max(0, totalAmt - allocatedAmt);
+    e.shortageAmt = 0;
+  });
+}
 
 function createDailyCombinedRow(branch, date, item) {
   return {
@@ -649,9 +634,6 @@ function mergeLockedRowsIntoMergedMap(mergedMap, lockedRows) {
     row.당해_판매금액 += toNumber(r.당해_판매금액);
     row.당해_폐기수량 += toNumber(r.당해_폐기수량);
     row.당해_폐기금액 += toNumber(r.당해_폐기금액);
-
-    row.부족수량 += toNumber(r.부족수량);
-    row.부족금액 += toNumber(r.부족금액);
   });
 }
 
@@ -683,15 +665,11 @@ function buildStockBalanceRows(stockMap, groupMap, lockedRows) {
     const entries = groupMap.get(key) || [];
     const locked = lockedUseMap.get(key) || {};
 
-    const prev2UsedQty =
-      toNumber(locked.prev2Qty) + entries.reduce((s, e) => s + toNumber(e.prev2Qty), 0);
-    const prev2UsedAmt =
-      toNumber(locked.prev2Amt) + entries.reduce((s, e) => s + toNumber(e.prev2Amt), 0);
+    const prev2UsedQty = toNumber(locked.prev2Qty) + entries.reduce((s, e) => s + toNumber(e.prev2Qty), 0);
+    const prev2UsedAmt = toNumber(locked.prev2Amt) + entries.reduce((s, e) => s + toNumber(e.prev2Amt), 0);
 
-    const prevUsedQty =
-      toNumber(locked.prevQty) + entries.reduce((s, e) => s + toNumber(e.prevQty), 0);
-    const prevUsedAmt =
-      toNumber(locked.prevAmt) + entries.reduce((s, e) => s + toNumber(e.prevAmt), 0);
+    const prevUsedQty = toNumber(locked.prevQty) + entries.reduce((s, e) => s + toNumber(e.prevQty), 0);
+    const prevUsedAmt = toNumber(locked.prevAmt) + entries.reduce((s, e) => s + toNumber(e.prevAmt), 0);
 
     rows.push({
       지점명: stock.지점명,
@@ -869,9 +847,6 @@ function processWorkbook(workbook) {
           부족금액: e.shortageAmt,
         });
       }
-
-      row.부족수량 += e.shortageQty;
-      row.부족금액 += e.shortageAmt;
     });
   }
 
@@ -1075,66 +1050,77 @@ function downloadWorkbook(result) {
   XLSX.writeFile(wb, "FIFO_연차별재고소진_감사용.xlsx");
 }
 
-function rerunWithLatestWorkbook() {
-  if (!latestWorkbook) return;
-
-  const result = processWorkbook(latestWorkbook);
-  latestResult = result;
-
-  updateStats(result);
-  renderIssues(result);
-  populateBranchFilter(result);
-  renderTables(result);
-
-  const downloadBtn = document.getElementById("downloadBtn");
-  if (downloadBtn) downloadBtn.disabled = false;
-}
-
-document.getElementById("fileInput")?.addEventListener("change", async (e) => {
-  const file = e.target.files[0];
-  if (!file) return;
-
-  try {
-    const data = await file.arrayBuffer();
-    latestWorkbook = XLSX.read(data, { type: "array" });
-
-    rerunWithLatestWorkbook();
-  } catch (error) {
-    alert("파일 처리 중 오류가 발생했습니다: " + error.message);
-  }
-});
-
-document.getElementById("lockedResultInput")?.addEventListener("change", async (e) => {
-  const file = e.target.files[0];
-
-  if (!file) {
-    lockedWorkbook = null;
-    rerunWithLatestWorkbook();
+function runProcess() {
+  if (!latestWorkbook) {
+    alert("먼저 원본 엑셀 파일을 선택해주세요.");
     return;
   }
 
   try {
-    const data = await file.arrayBuffer();
-    lockedWorkbook = XLSX.read(data, { type: "array" });
+    const result = processWorkbook(latestWorkbook);
+    latestResult = result;
 
-    rerunWithLatestWorkbook();
+    updateStats(result);
+    renderIssues(result);
+    populateBranchFilter(result);
+    renderTables(result);
+
+    const downloadBtn = document.getElementById("downloadBtn");
+    if (downloadBtn) downloadBtn.disabled = false;
   } catch (error) {
-    alert("기존 제출 결과 파일 처리 중 오류가 발생했습니다: " + error.message);
+    alert("실행 중 오류가 발생했습니다: " + error.message);
   }
-});
+}
 
-document.getElementById("downloadBtn")?.addEventListener("click", () => {
-  if (!latestResult) return;
-  downloadWorkbook(latestResult);
-});
+document.addEventListener("DOMContentLoaded", () => {
+  setDefaultTodayDates();
 
-document.getElementById("branchFilter")?.addEventListener("change", () => {
-  if (!latestResult) return;
-  renderTables(latestResult);
-});
+  const runBtn = document.getElementById("runBtn");
+  if (runBtn) runBtn.disabled = false;
 
-["prev2CutoffDate", "prevCutoffDate", "finalCutoffDate", "cutoffDate"].forEach((id) => {
-  document.getElementById(id)?.addEventListener("change", () => {
-    rerunWithLatestWorkbook();
+  document.getElementById("fileInput")?.addEventListener("change", async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    try {
+      const data = await file.arrayBuffer();
+      latestWorkbook = XLSX.read(data, { type: "array" });
+    } catch (error) {
+      alert("원본 파일 처리 중 오류가 발생했습니다: " + error.message);
+    }
+  });
+
+  document.getElementById("lockedResultInput")?.addEventListener("change", async (e) => {
+    const file = e.target.files[0];
+
+    if (!file) {
+      lockedWorkbook = null;
+      return;
+    }
+
+    try {
+      const data = await file.arrayBuffer();
+      lockedWorkbook = XLSX.read(data, { type: "array" });
+    } catch (error) {
+      alert("기존 제출 결과 파일 처리 중 오류가 발생했습니다: " + error.message);
+    }
+  });
+
+  document.getElementById("runBtn")?.addEventListener("click", () => {
+    runProcess();
+  });
+
+  document.getElementById("downloadBtn")?.addEventListener("click", () => {
+    if (!latestResult) {
+      alert("먼저 실행 버튼을 눌러 계산해주세요.");
+      return;
+    }
+
+    downloadWorkbook(latestResult);
+  });
+
+  document.getElementById("branchFilter")?.addEventListener("change", () => {
+    if (!latestResult) return;
+    renderTables(latestResult);
   });
 });
