@@ -363,28 +363,176 @@ function parseLockedDetailRows(workbook, sheetName, type) {
   const ws = workbook.Sheets[sheetName];
   if (!ws || !ws["!ref"]) return [];
 
-  return XLSX.utils.sheet_to_json(ws, { defval: "" }).map((r) => ({
-    구분: normalizeText(r.구분) || `${type}_기존제출`,
-    지점명: normalizeText(r.지점명),
-    날짜: formatDate(r.날짜),
-    품목: normalizeText(r.품목),
+const rows = XLSX.utils.sheet_to_json(ws, { defval: "" }).map((r) => ({
+  구분: normalizeText(r.구분) || `${type}_기존제출`,
+  지점명: normalizeText(r.지점명),
+  날짜: formatDate(r.날짜),
+  품목: normalizeText(r.품목),
 
-    총사용수량: toNumber(r.총사용수량),
-    총사용금액: toNumber(r.총사용금액),
+  총사용수량: toNumber(r.총사용수량),
+  총사용금액: toNumber(r.총사용금액),
 
-    전전년사용수량: toNumber(r.전전년사용수량),
-    전전년사용금액: toNumber(r.전전년사용금액),
+  전전년사용수량: toNumber(r.전전년사용수량),
+  전전년사용금액: toNumber(r.전전년사용금액),
 
-    전년사용수량: toNumber(r.전년사용수량),
-    전년사용금액: toNumber(r.전년사용금액),
+  전년사용수량: toNumber(r.전년사용수량),
+  전년사용금액: toNumber(r.전년사용금액),
 
-    당해사용수량: toNumber(r.당해사용수량),
-    당해사용금액: toNumber(r.당해사용금액),
+  당해사용수량: toNumber(r.당해사용수량),
+  당해사용금액: toNumber(r.당해사용금액),
 
-    부족수량: 0,
-    부족금액: 0,
-  }));
+  부족수량: 0,
+  부족금액: 0,
+}));
+
+return fixDetailRowsQtyAmountPair(rows);
+
+function fixDetailRowsQtyAmountPair(rows) {
+  return rows.map((row) => {
+    const fixed = { ...row };
+
+    const totalAmt = Math.round(toNumber(fixed.총사용금액));
+
+    const pairs = [
+      {
+        qtyField: "전전년사용수량",
+        amtField: "전전년사용금액",
+      },
+      {
+        qtyField: "전년사용수량",
+        amtField: "전년사용금액",
+      },
+      {
+        qtyField: "당해사용수량",
+        amtField: "당해사용금액",
+      },
+    ];
+
+    const qtyParts = pairs
+      .map((p) => ({
+        ...p,
+        qty: toNumber(fixed[p.qtyField]),
+      }))
+      .filter((p) => p.qty > 0);
+
+    // 일단 수량 없는 연차의 금액은 무조건 제거
+    pairs.forEach((p) => {
+      if (toNumber(fixed[p.qtyField]) <= 0) {
+        fixed[p.amtField] = 0;
+      }
+    });
+
+    // 수량이 없으면 배분할 대상이 없으므로 금액도 0 처리
+    if (!qtyParts.length) {
+      pairs.forEach((p) => {
+        fixed[p.amtField] = 0;
+      });
+
+      return fixed;
+    }
+
+    // 총금액이 0이면 금액을 배분할 수 없음
+    // 이 경우는 원본/기존제출 자체 오류이므로 0으로 둠
+    if (totalAmt <= 0) {
+      pairs.forEach((p) => {
+        fixed[p.amtField] = 0;
+      });
+
+      return fixed;
+    }
+
+    // 기존 금액 배분을 믿지 않고,
+    // 총사용금액을 수량 있는 연차에 다시 배분한다.
+    pairs.forEach((p) => {
+      fixed[p.amtField] = 0;
+    });
+
+    // 수량 있는 연차에 최소 1원 보장
+    // 단, 총금액이 연차 수보다 작으면 완전 보정 불가
+    if (totalAmt >= qtyParts.length) {
+      qtyParts.forEach((p) => {
+        fixed[p.amtField] = 1;
+      });
+
+      let remain = totalAmt - qtyParts.length;
+      const totalQty = qtyParts.reduce((sum, p) => sum + p.qty, 0);
+
+      const temp = qtyParts.map((p) => {
+        const exact = (remain * p.qty) / totalQty;
+        const base = Math.floor(exact);
+
+        return {
+          ...p,
+          base,
+          frac: exact - base,
+        };
+      });
+
+      let assigned = 0;
+
+      temp.forEach((p) => {
+        fixed[p.amtField] += p.base;
+        assigned += p.base;
+      });
+
+      let leftover = remain - assigned;
+
+      temp.sort((a, b) => b.frac - a.frac);
+
+      let i = 0;
+      while (leftover > 0 && temp.length) {
+        const p = temp[i % temp.length];
+        fixed[p.amtField] += 1;
+        leftover -= 1;
+        i += 1;
+      }
+    } else {
+      // 거의 발생하지 않는 예외:
+      // 총금액이 너무 작아 수량 있는 모든 연차에 1원씩 줄 수 없는 경우
+      const sorted = [...qtyParts].sort((a, b) => b.qty - a.qty);
+      let remainSmall = totalAmt;
+
+      sorted.forEach((p) => {
+        if (remainSmall > 0) {
+          fixed[p.amtField] = 1;
+          remainSmall -= 1;
+        }
+      });
+    }
+
+    // 최종 보정: 총금액과 배분금액 일치
+    const allocated = pairs.reduce(
+      (sum, p) => sum + toNumber(fixed[p.amtField]),
+      0
+    );
+
+    const diff = totalAmt - allocated;
+
+    if (diff !== 0) {
+      const receiver =
+        qtyParts.find((p) => p.amtField === "당해사용금액") ||
+        qtyParts.find((p) => p.amtField === "전년사용금액") ||
+        qtyParts[0];
+
+      fixed[receiver.amtField] += diff;
+    }
+
+    // 최종 안전장치:
+    // 수량 없는 연차 금액 제거
+    pairs.forEach((p) => {
+      if (toNumber(fixed[p.qtyField]) <= 0) {
+        fixed[p.amtField] = 0;
+      }
+
+      if (toNumber(fixed[p.amtField]) < 0) {
+        fixed[p.amtField] = 0;
+      }
+    });
+
+    return fixed;
+  });
 }
+
 
 function buildLockedDetailDailyMap(workbook) {
   const map = new Map();
