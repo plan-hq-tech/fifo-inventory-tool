@@ -386,6 +386,62 @@ function parseLockedDetailRows(workbook, sheetName, type) {
   }));
 }
 
+function buildLockedDetailDailyMap(workbook) {
+  const map = new Map();
+
+  const lockedSalesRows = parseLockedDetailRows(workbook, "판매자동소진", "판매");
+  const lockedDiscardRows = parseLockedDetailRows(workbook, "폐기자동소진", "폐기");
+
+  function ensure(branch, date, item) {
+    const key = makeDailyKey(branch, date, item);
+
+    if (!map.has(key)) {
+      map.set(key, createDailyCombinedRow(branch, date, item));
+    }
+
+    return map.get(key);
+  }
+
+  lockedSalesRows.forEach((r) => {
+    const row = ensure(r.지점명, r.날짜, r.품목);
+
+    row.판매수량 += toNumber(r.총사용수량);
+    row.판매금액 += toNumber(r.총사용금액);
+
+    row.전전년_판매수량 += toNumber(r.전전년사용수량);
+    row.전전년_판매금액 += toNumber(r.전전년사용금액);
+
+    row.전년_판매수량 += toNumber(r.전년사용수량);
+    row.전년_판매금액 += toNumber(r.전년사용금액);
+
+    row.당해_판매수량 += toNumber(r.당해사용수량);
+    row.당해_판매금액 += toNumber(r.당해사용금액);
+  });
+
+  lockedDiscardRows.forEach((r) => {
+    const row = ensure(r.지점명, r.날짜, r.품목);
+
+    row.폐기수량 += toNumber(r.총사용수량);
+    row.폐기금액 += toNumber(r.총사용금액);
+
+    row.전전년_폐기수량 += toNumber(r.전전년사용수량);
+    row.전전년_폐기금액 += toNumber(r.전전년사용금액);
+
+    row.전년_폐기수량 += toNumber(r.전년사용수량);
+    row.전년_폐기금액 += toNumber(r.전년사용금액);
+
+    row.당해_폐기수량 += toNumber(r.당해사용수량);
+    row.당해_폐기금액 += toNumber(r.당해사용금액);
+  });
+
+  for (const row of map.values()) {
+    row.총사용수량 = row.판매수량 + row.폐기수량;
+    row.총사용금액 = row.판매금액 + row.폐기금액;
+  }
+
+  return map;
+}
+
 function buildLockedMap(lockedRows) {
   const map = new Map();
 
@@ -819,6 +875,37 @@ function mergeLockedRowsIntoMergedMap(mergedMap, lockedRows) {
     row.부족수량 += toNumber(r.부족수량);
     row.부족금액 += toNumber(r.부족금액);
   });
+
+  // 중요:
+  // 기존제출파일의 일별통합결과에 전년/당해 값이 없더라도
+  // 판매자동소진, 폐기자동소진 시트의 상세값을 다시 합산해서 보정한다.
+  const detailDailyMap = buildLockedDetailDailyMap(lockedWorkbook);
+
+  for (const [key, detailRow] of detailDailyMap.entries()) {
+    if (!mergedMap.has(key)) {
+      mergedMap.set(key, detailRow);
+      continue;
+    }
+
+    const row = mergedMap.get(key);
+
+    // 총 판매/폐기 수량·금액은 일별통합결과 값이 있으면 유지하고,
+    // 상세 시트 기준 연차별 배분값만 강제로 보정한다.
+    row.전전년_판매수량 = toNumber(detailRow.전전년_판매수량);
+    row.전전년_판매금액 = toNumber(detailRow.전전년_판매금액);
+    row.전전년_폐기수량 = toNumber(detailRow.전전년_폐기수량);
+    row.전전년_폐기금액 = toNumber(detailRow.전전년_폐기금액);
+
+    row.전년_판매수량 = toNumber(detailRow.전년_판매수량);
+    row.전년_판매금액 = toNumber(detailRow.전년_판매금액);
+    row.전년_폐기수량 = toNumber(detailRow.전년_폐기수량);
+    row.전년_폐기금액 = toNumber(detailRow.전년_폐기금액);
+
+    row.당해_판매수량 = toNumber(detailRow.당해_판매수량);
+    row.당해_판매금액 = toNumber(detailRow.당해_판매금액);
+    row.당해_폐기수량 = toNumber(detailRow.당해_폐기수량);
+    row.당해_폐기금액 = toNumber(detailRow.당해_폐기금액);
+  }
 }
 
 /*************************************************
