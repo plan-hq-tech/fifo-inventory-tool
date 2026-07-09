@@ -1,14 +1,14 @@
 /*************************************************
  * FIFO 연차별 재고 소진 프로그램 - script.js
  *
- * 최종 대전제
+ * 최종 반영사항
  * 1. 기존 제출파일의 전전년 사용수량/금액은 절대 변경하지 않는다.
- * 2. 모든 연차별 데이터는 수량과 금액이 반드시 같이 있어야 한다.
+ * 2. 전전년 값이 재고를 초과하면 자동 수정하지 않고 검증오류로 표시한다.
  * 3. 기존 제출 이후 증가분은 전부 당해로 처리한다.
- * 4. 전전년/전년 총 사용량은 총 재고 수량·금액을 초과하면 안 된다.
- * 5. 전전년 재고는 기준일까지 소진 목적, 전년 재고는 연말까지 소진 목적이다.
- * 6. 당해 재고는 이월 가능하다.
- * 7. 기존 제출파일의 전전년 값이 이미 재고를 초과하면 자동 수정하지 않고 검증오류로 표시한다.
+ * 4. 전년 재고 금액 초과분은 당해로 이동한다.
+ * 5. 전년 수량은 기본적으로 건드리지 않는다.
+ * 6. 단, 당해에 수량만 있거나 금액만 있는 오류가 생기면 전년 → 당해 방향으로만 보정한다.
+ * 7. 최종적으로 수량만 있거나 금액만 있는 연차별 데이터가 없도록 검증한다.
  *************************************************/
 
 const MAIN_SHEET = "2025";
@@ -362,7 +362,7 @@ function createDailyCombinedRow(branch, date, item) {
 }
 
 /*************************************************
- * 기존 제출 상세행 정리
+ * 기존 제출 상세행 파싱
  * 전전년 값은 절대 변경하지 않는다.
  *************************************************/
 
@@ -664,7 +664,6 @@ function addDeltaRowsAsCurrent(mergedMap, deltaRows) {
 
 /*************************************************
  * 최종 일별 행 정리
- * 전전년/전년/당해 연차별 값은 여기서 임의 재배분하지 않는다.
  *************************************************/
 
 function finalizeDailyRow(row) {
@@ -700,11 +699,10 @@ function finalizeDailyRow(row) {
 /*************************************************
  * 전년 금액 초과분 조정
  *
- * 중요:
- * - 전년 수량은 기본적으로 건드리지 않는다.
- * - 당해에 이미 수량이 있으면 금액만 당해로 넘긴다.
- * - 당해에 수량이 없으면 금액만 넘길 수 없으므로 필요한 수량 일부를 같이 넘긴다.
- * - 전전년은 절대 건드리지 않는다.
+ * - 전년 사용금액이 전년 재고금액을 초과하면 초과금액을 당해로 이동
+ * - 당해에 이미 수량이 있으면 금액만 이동
+ * - 당해에 수량이 없으면 금액만 생기지 않도록 수량 일부도 같이 이동
+ * - 전전년은 절대 건드리지 않음
  *************************************************/
 
 function enforcePrevStockAmountLimit(dailyRows, stockMap) {
@@ -715,10 +713,6 @@ function enforcePrevStockAmountLimit(dailyRows, stockMap) {
     if (!grouped.has(key)) grouped.set(key, []);
     grouped.get(key).push(row);
   });
-
-  function getPrevQty(row) {
-    return roundNumber(row.전년_판매수량) + roundNumber(row.전년_폐기수량);
-  }
 
   function getPrevAmt(row) {
     return roundNumber(row.전년_판매금액) + roundNumber(row.전년_폐기금액);
@@ -749,7 +743,7 @@ function enforcePrevStockAmountLimit(dailyRows, stockMap) {
     } else {
       if (prevQty <= 0) return 0;
 
-      moveQty = Math.max(1, Math.round((prevQty * moveAmt) / prevAmt));
+      moveQty = Math.max(1, Math.round((prevQty * moveAmt) / Math.max(1, prevAmt)));
 
       if (moveQty >= prevQty && moveAmt < prevAmt) {
         moveQty = prevQty - 1;
@@ -776,7 +770,6 @@ function enforcePrevStockAmountLimit(dailyRows, stockMap) {
     if (!stock) continue;
 
     const prevStockAmt = Math.max(0, roundNumber(stock.전년금액));
-
     let totalPrevAmt = rows.reduce((sum, row) => sum + getPrevAmt(row), 0);
     let excessAmt = totalPrevAmt - prevStockAmt;
 
@@ -787,9 +780,7 @@ function enforcePrevStockAmountLimit(dailyRows, stockMap) {
       return 0;
     });
 
-    /*************************************************
-     * 1차: 당해 수량이 이미 있는 행은 금액만 이동
-     *************************************************/
+    // 1차: 당해 수량이 이미 있는 행은 금액만 이동
     for (const row of reverseRows) {
       if (excessAmt <= 0) break;
       excessAmt -= movePrevToCurrent(row, "폐기", excessAmt, false);
@@ -797,9 +788,7 @@ function enforcePrevStockAmountLimit(dailyRows, stockMap) {
       excessAmt -= movePrevToCurrent(row, "판매", excessAmt, false);
     }
 
-    /*************************************************
-     * 2차: 그래도 초과가 남으면 수량 일부도 같이 이동
-     *************************************************/
+    // 2차: 그래도 초과가 남으면 수량 일부도 같이 이동
     for (const row of reverseRows) {
       if (excessAmt <= 0) break;
       excessAmt -= movePrevToCurrent(row, "폐기", excessAmt, true);
@@ -814,11 +803,10 @@ function enforcePrevStockAmountLimit(dailyRows, stockMap) {
 /*************************************************
  * 전년 재고 최종 초과 방지
  *
- * 목적:
- * - 전년 사용수량 또는 사용금액이 전년 재고를 초과하면 최종적으로 당해로 이동
- * - 단, 수량은 불필요하게 건드리지 않는다.
- * - 전년 금액 초과는 금액 우선 이동
- * - 전년 수량 초과가 실제로 발생한 경우에만 수량과 금액을 같이 이동
+ * - 전년 수량/금액이 재고를 초과하면 뒤 날짜부터 당해로 이동
+ * - 수량 초과가 실제로 있을 때만 수량 이동
+ * - 금액 초과는 금액 이동
+ * - 전전년은 절대 건드리지 않음
  *************************************************/
 
 function enforcePrevStockFinalCap(dailyRows, stockMap) {
@@ -856,7 +844,7 @@ function enforcePrevStockFinalCap(dailyRows, stockMap) {
       moveQty = Math.min(needQty, prevQty);
 
       if (prevAmt > 0) {
-        moveAmt = Math.round((prevAmt * moveQty) / prevQty);
+        moveAmt = Math.round((prevAmt * moveQty) / Math.max(1, prevQty));
       }
     }
 
@@ -864,16 +852,16 @@ function enforcePrevStockFinalCap(dailyRows, stockMap) {
       moveAmt = Math.min(needAmt, prevAmt);
 
       if (moveQty <= 0 && prevQty > 0) {
-        moveQty = Math.max(1, Math.round((prevQty * moveAmt) / prevAmt));
+        moveQty = Math.max(1, Math.round((prevQty * moveAmt) / Math.max(1, prevAmt)));
       }
     }
 
     if (moveQty >= prevQty && moveAmt < prevAmt) {
-      moveQty = prevQty - 1;
+      moveQty = Math.max(0, prevQty - 1);
     }
 
     if (moveAmt >= prevAmt && moveQty < prevQty) {
-      moveAmt = prevAmt - 1;
+      moveAmt = Math.max(0, prevAmt - 1);
     }
 
     moveQty = Math.max(0, Math.min(moveQty, prevQty));
@@ -925,6 +913,103 @@ function enforcePrevStockFinalCap(dailyRows, stockMap) {
 
     rows.forEach(finalizeDailyRow);
   }
+}
+
+/*************************************************
+ * 당해 수량·금액 짝오류 최종 보정
+ *
+ * - 월성점처럼 당해 수량만 있거나 금액만 있는 오류 방지
+ * - 전전년은 절대 건드리지 않음
+ * - 전년 → 당해 방향으로만 보정
+ *************************************************/
+
+function repairCurrentPairErrors(dailyRows) {
+  function repairPart(row, part) {
+    const prevQtyField = part === "판매" ? "전년_판매수량" : "전년_폐기수량";
+    const prevAmtField = part === "판매" ? "전년_판매금액" : "전년_폐기금액";
+    const curQtyField = part === "판매" ? "당해_판매수량" : "당해_폐기수량";
+    const curAmtField = part === "판매" ? "당해_판매금액" : "당해_폐기금액";
+
+    let prevQty = roundNumber(row[prevQtyField]);
+    let prevAmt = roundNumber(row[prevAmtField]);
+    let curQty = roundNumber(row[curQtyField]);
+    let curAmt = roundNumber(row[curAmtField]);
+
+    // 1. 당해 수량만 있고 금액이 없는 경우 → 전년 금액 일부를 당해로 이동
+    if (curQty > 0 && curAmt <= 0) {
+      if (prevAmt > 0) {
+        const totalQty = prevQty + curQty;
+        const totalAmt = prevAmt + curAmt;
+
+        let targetCurAmt = Math.round((totalAmt * curQty) / Math.max(1, totalQty));
+        targetCurAmt = Math.max(1, targetCurAmt);
+
+        let moveAmt = targetCurAmt - curAmt;
+
+        if (prevQty > 0) {
+          moveAmt = Math.min(moveAmt, Math.max(0, prevAmt - 1));
+        } else {
+          moveAmt = Math.min(moveAmt, prevAmt);
+        }
+
+        if (moveAmt > 0) {
+          prevAmt -= moveAmt;
+          curAmt += moveAmt;
+        }
+      }
+    }
+
+    // 2. 당해 금액만 있고 수량이 없는 경우 → 전년 수량 일부를 당해로 이동
+    if (curAmt > 0 && curQty <= 0) {
+      if (prevQty > 0) {
+        const totalQty = prevQty + curQty;
+        const totalAmt = prevAmt + curAmt;
+
+        let targetCurQty = 1;
+
+        if (totalAmt > 0) {
+          targetCurQty = Math.round((totalQty * curAmt) / totalAmt);
+        }
+
+        targetCurQty = Math.max(1, targetCurQty);
+
+        let moveQty = Math.min(targetCurQty, prevQty);
+
+        if (moveQty >= prevQty && prevAmt > 0) {
+          curAmt += prevAmt;
+          prevAmt = 0;
+        }
+
+        if (moveQty > 0) {
+          prevQty -= moveQty;
+          curQty += moveQty;
+        }
+      }
+    }
+
+    // 3. 전년에 수량만 남고 금액이 없는 경우 → 당해가 있으면 전년 수량을 당해로 이동
+    if (prevQty > 0 && prevAmt <= 0 && (curQty > 0 || curAmt > 0)) {
+      curQty += prevQty;
+      prevQty = 0;
+    }
+
+    // 4. 전년에 금액만 남고 수량이 없는 경우 → 당해가 있으면 전년 금액을 당해로 이동
+    if (prevAmt > 0 && prevQty <= 0 && (curQty > 0 || curAmt > 0)) {
+      curAmt += prevAmt;
+      prevAmt = 0;
+    }
+
+    row[prevQtyField] = Math.max(0, roundNumber(prevQty));
+    row[prevAmtField] = Math.max(0, roundNumber(prevAmt));
+    row[curQtyField] = Math.max(0, roundNumber(curQty));
+    row[curAmtField] = Math.max(0, roundNumber(curAmt));
+  }
+
+  dailyRows.forEach((row) => {
+    repairPart(row, "판매");
+    repairPart(row, "폐기");
+    finalizeDailyRow(row);
+  });
 }
 
 /*************************************************
@@ -1239,12 +1324,14 @@ function processWorkbook(workbook) {
 
   /*************************************************
    * 중요 처리 순서
-   * 1. 전년 금액 초과분을 우선 당해로 이동
-   * 2. 최종적으로 전년 수량/금액 초과가 남지 않도록 확인
-   * 3. 전전년은 절대 수정하지 않음
+   * 1. 전년 금액 초과분을 당해로 이동
+   * 2. 전년 재고 수량/금액 초과가 남지 않도록 최종 확인
+   * 3. 월성점처럼 당해 수량만/금액만 있는 오류를 최종 보정
+   * 4. 전전년은 절대 수정하지 않음
    *************************************************/
   enforcePrevStockAmountLimit(mergedDailyRows, stockMap);
   enforcePrevStockFinalCap(mergedDailyRows, stockMap);
+  repairCurrentPairErrors(mergedDailyRows);
 
   mergedDailyRows = sortRowsByBusinessOrder(mergedDailyRows).map(finalizeDailyRow);
 
@@ -1260,8 +1347,8 @@ function processWorkbook(workbook) {
     schemaErrors: [],
     anomalyIssues,
     mergedDailyRows,
-    salesRows,
-    discardRows,
+    salesRows: sortRowsByBusinessOrder(salesRows),
+    discardRows: sortRowsByBusinessOrder(discardRows),
     validationRows,
     stockBalanceRows,
     remainStockRows,
