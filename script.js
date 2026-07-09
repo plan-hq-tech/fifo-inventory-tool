@@ -544,6 +544,99 @@ function parseLockedDetailRows(workbook, sheetName, type) {
   })).filter((r) => r.지점명 && r.날짜 && r.품목);
 }
 
+function fixDailyRowQtyAmountPairs(row) {
+  const pairs = [
+    ["전전년_판매수량", "전전년_판매금액"],
+    ["전년_판매수량", "전년_판매금액"],
+    ["당해_판매수량", "당해_판매금액"],
+
+    ["전전년_폐기수량", "전전년_폐기금액"],
+    ["전년_폐기수량", "전년_폐기금액"],
+    ["당해_폐기수량", "당해_폐기금액"],
+  ];
+
+  pairs.forEach(([qtyField, amtField]) => {
+    const qty = Math.round(toNumber(row[qtyField]));
+    const amt = Math.round(toNumber(row[amtField]));
+
+    // 수량이 없는데 금액만 있으면 당해 금액으로 옮기지 않고,
+    // 같은 판매/폐기 안에서 수량 있는 연차로 흡수한다.
+    if (qty <= 0 && amt > 0) {
+      const isSale = qtyField.includes("판매");
+      const candidates = isSale
+        ? [
+            ["당해_판매수량", "당해_판매금액"],
+            ["전년_판매수량", "전년_판매금액"],
+            ["전전년_판매수량", "전전년_판매금액"],
+          ]
+        : [
+            ["당해_폐기수량", "당해_폐기금액"],
+            ["전년_폐기수량", "전년_폐기금액"],
+            ["전전년_폐기수량", "전전년_폐기금액"],
+          ];
+
+      const receiver = candidates.find(([q]) => toNumber(row[q]) > 0);
+
+      if (receiver) {
+        row[receiver[1]] = Math.round(toNumber(row[receiver[1]]) + amt);
+      }
+
+      row[amtField] = 0;
+    }
+  });
+
+  // 수량은 있는데 금액이 없는 경우:
+  // 같은 판매/폐기 총금액과 연차별 금액합을 비교해서
+  // 남는 금액이 있으면 해당 연차에 배정한다.
+  const saleAmtSum =
+    toNumber(row.전전년_판매금액) +
+    toNumber(row.전년_판매금액) +
+    toNumber(row.당해_판매금액);
+
+  const saleDiff = Math.round(toNumber(row.판매금액) - saleAmtSum);
+
+  if (saleDiff > 0) {
+    if (toNumber(row.당해_판매수량) > 0 && toNumber(row.당해_판매금액) <= 0) {
+      row.당해_판매금액 += saleDiff;
+    } else if (toNumber(row.전년_판매수량) > 0 && toNumber(row.전년_판매금액) <= 0) {
+      row.전년_판매금액 += saleDiff;
+    } else if (toNumber(row.전전년_판매수량) > 0 && toNumber(row.전전년_판매금액) <= 0) {
+      row.전전년_판매금액 += saleDiff;
+    } else if (toNumber(row.당해_판매수량) > 0) {
+      row.당해_판매금액 += saleDiff;
+    } else if (toNumber(row.전년_판매수량) > 0) {
+      row.전년_판매금액 += saleDiff;
+    } else if (toNumber(row.전전년_판매수량) > 0) {
+      row.전전년_판매금액 += saleDiff;
+    }
+  }
+
+  const discardAmtSum =
+    toNumber(row.전전년_폐기금액) +
+    toNumber(row.전년_폐기금액) +
+    toNumber(row.당해_폐기금액);
+
+  const discardDiff = Math.round(toNumber(row.폐기금액) - discardAmtSum);
+
+  if (discardDiff > 0) {
+    if (toNumber(row.당해_폐기수량) > 0 && toNumber(row.당해_폐기금액) <= 0) {
+      row.당해_폐기금액 += discardDiff;
+    } else if (toNumber(row.전년_폐기수량) > 0 && toNumber(row.전년_폐기금액) <= 0) {
+      row.전년_폐기금액 += discardDiff;
+    } else if (toNumber(row.전전년_폐기수량) > 0 && toNumber(row.전전년_폐기금액) <= 0) {
+      row.전전년_폐기금액 += discardDiff;
+    } else if (toNumber(row.당해_폐기수량) > 0) {
+      row.당해_폐기금액 += discardDiff;
+    } else if (toNumber(row.전년_폐기수량) > 0) {
+      row.전년_폐기금액 += discardDiff;
+    } else if (toNumber(row.전전년_폐기수량) > 0) {
+      row.전전년_폐기금액 += discardDiff;
+    }
+  }
+
+  return row;
+}
+
 function buildLockedDetailDailyMap(workbook) {
   const map = new Map();
 
@@ -844,15 +937,6 @@ function fixQtyAmountPair(entries) {
 }
 
 function allocateGroupPeriod(entries, stock) {
-  const prev2Cutoff = getPrev2CutoffDate();
-  const prevCutoff = getPrevCutoffDate();
-
-  entries.sort((a, b) => {
-    if (a.date !== b.date) return a.date.localeCompare(b.date);
-    if (a.type !== b.type) return a.type === "판매" ? -1 : 1;
-    return 0;
-  });
-
   entries.forEach((e) => {
     e.remainQty = Math.round(toNumber(e.qty));
 
@@ -865,7 +949,17 @@ function allocateGroupPeriod(entries, stock) {
     e.prevAmt = 0;
     e.currentAmt = 0;
     e.shortageAmt = 0;
+
+    // 기존 제출 이후 증가분은 기존 연차별 배분을 건드리지 않고
+    // 감사 일관성을 위해 전부 당해 사용으로 처리한다.
+    e.currentQty = Math.max(0, Math.round(toNumber(e.qty)));
+    e.currentAmt = Math.max(0, Math.round(toNumber(e.amt)));
+
+    e.remainQty = 0;
+    e.shortageQty = 0;
+    e.shortageAmt = 0;
   });
+}
 
   allocateSequentialFIFO(
     entries,
@@ -985,6 +1079,9 @@ function buildValidationRows(dailyRows) {
 
       부족수량: row.부족수량,
       부족금액: row.부족금액,
+
+      전전년재고초과: "",
+      전년재고초과: "",
     };
   });
 }
@@ -1272,19 +1369,21 @@ function processWorkbook(workbook) {
   }
 
   const mergedDailyRows = sortRowsByBusinessOrder(Array.from(mergedMap.values())).map((row) => {
-    row.판매수량 = Math.round(toNumber(row.판매수량));
-    row.판매금액 = Math.round(toNumber(row.판매금액));
-    row.폐기수량 = Math.round(toNumber(row.폐기수량));
-    row.폐기금액 = Math.round(toNumber(row.폐기금액));
+  row.판매수량 = Math.round(toNumber(row.판매수량));
+  row.판매금액 = Math.round(toNumber(row.판매금액));
+  row.폐기수량 = Math.round(toNumber(row.폐기수량));
+  row.폐기금액 = Math.round(toNumber(row.폐기금액));
 
-    row.총사용수량 = row.판매수량 + row.폐기수량;
-    row.총사용금액 = row.판매금액 + row.폐기금액;
+  row.총사용수량 = row.판매수량 + row.폐기수량;
+  row.총사용금액 = row.판매금액 + row.폐기금액;
 
-    row.부족수량 = 0;
-    row.부족금액 = 0;
+  row.부족수량 = 0;
+  row.부족금액 = 0;
 
-    return row;
-  });
+  fixDailyRowQtyAmountPairs(row);
+
+  return row;
+});
 
   const validationRows = sortRowsByBusinessOrder(buildValidationRows(mergedDailyRows));
   const stockBalanceRows = buildStockBalanceRows(stockMap, groupMap, lockedWorkbook);
