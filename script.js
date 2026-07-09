@@ -1,11 +1,10 @@
 /*************************************************
  * FIFO 연차별 재고 소진 프로그램 - script.js
- * 기준:
- * 1) 기존 제출 결과는 고정값으로 유지한다.
- * 2) 새 원본에서 기존 제출보다 증가한 판매/폐기만 계산한다.
- * 3) 증가분은 전전년/전년을 건드리지 않고 전부 당해 사용으로 처리한다.
- * 4) 최종 일별통합결과에서 수량만 있거나 금액만 있는 짝오류를 보정한다.
- * 5) 전전년/전년 사용량이 재고를 초과하는지는 검증 시트에 표시한다.
+ * 최종 기준
+ * 1) 기존 제출자료는 수량 기준으로 고정한다.
+ * 2) 기존 제출자료에 수량만/금액만 있는 경우, 같은 행 안에서 금액만 재배분한다.
+ * 3) 새 증가분은 기존 사용량을 뺀 잔여 전전년 → 잔여 전년 → 당해 순서로 FIFO 배분한다.
+ * 4) 최종 결과에서 수량과 금액은 반드시 같이 존재하도록 보정한다.
  *************************************************/
 
 const MAIN_SHEET = "2025";
@@ -40,21 +39,13 @@ function normalizeHeaderText(v) {
 
 function todayString() {
   const d = new Date();
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
 function excelDateToJS(value) {
   if (!value) return null;
   if (value instanceof Date) return value;
-
-  if (typeof value === "number") {
-    const utcDays = Math.floor(value - 25569);
-    return new Date(utcDays * 86400 * 1000);
-  }
-
+  if (typeof value === "number") return new Date(Math.floor(value - 25569) * 86400 * 1000);
   const d = new Date(value);
   return Number.isNaN(d.getTime()) ? null : d;
 }
@@ -62,11 +53,7 @@ function excelDateToJS(value) {
 function formatDate(value) {
   const d = excelDateToJS(value);
   if (!d) return normalizeText(value);
-
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
 function getDateInput(id) {
@@ -135,22 +122,18 @@ function sortRowsByBusinessOrder(rows) {
     const ib = itemOrderIndex(b.품목군 || b.품목);
     if (ia !== ib) return ia - ib;
 
-    return normalizeText(a.품목군 || a.품목).localeCompare(
-      normalizeText(b.품목군 || b.품목)
-    );
+    return normalizeText(a.품목군 || a.품목).localeCompare(normalizeText(b.품목군 || b.품목));
   });
 }
 
 function parseHorizontal2025Sheet(workbook) {
   const ws = workbook.Sheets[MAIN_SHEET];
-
   if (!ws) throw new Error(`시트 '${MAIN_SHEET}' 을(를) 찾을 수 없습니다.`);
   if (!ws["!ref"]) throw new Error(`시트 '${MAIN_SHEET}' 의 범위를 읽을 수 없습니다.`);
 
   const range = XLSX.utils.decode_range(ws["!ref"]);
-  const rows = [];
   const branchBlocks = [];
-
+  const rows = [];
   let currentBranch = null;
 
   const headerRowBranch = 9;
@@ -211,9 +194,7 @@ function parseHorizontal2025Sheet(workbook) {
     branchBlocks.push(currentBranch);
   }
 
-  if (!branchBlocks.length) {
-    throw new Error("2025 시트에서 유효한 지점 블록을 찾지 못했습니다.");
-  }
+  if (!branchBlocks.length) throw new Error("2025 시트에서 유효한 지점 블록을 찾지 못했습니다.");
 
   for (let r = dataStartRow; r <= range.e.r + 1; r++) {
     const 날짜 = formatDate(getCellValue(ws, `A${r}`));
@@ -221,21 +202,21 @@ function parseHorizontal2025Sheet(workbook) {
 
     if (!날짜 && !품목) continue;
 
-    branchBlocks.forEach((block) => {
-      const 판매수량 = roundNumber(getCellValue(ws, `${block.판매수량Col}${r}`));
-      const 판매금액 = roundNumber(getCellValue(ws, `${block.판매금액Col}${r}`));
-      const 폐기수량 = roundNumber(getCellValue(ws, `${block.폐기수량Col}${r}`));
-      const 폐기금액 = roundNumber(getCellValue(ws, `${block.폐기금액Col}${r}`));
+    branchBlocks.forEach((b) => {
+      const 판매수량 = roundNumber(getCellValue(ws, `${b.판매수량Col}${r}`));
+      const 판매금액 = roundNumber(getCellValue(ws, `${b.판매금액Col}${r}`));
+      const 폐기수량 = roundNumber(getCellValue(ws, `${b.폐기수량Col}${r}`));
+      const 폐기금액 = roundNumber(getCellValue(ws, `${b.폐기금액Col}${r}`));
 
       if (판매수량 === 0 && 판매금액 === 0 && 폐기수량 === 0 && 폐기금액 === 0) return;
 
       rows.push({
-        지점명: block.지점명,
+        지점명: b.지점명,
         날짜,
         품목,
         판매수량,
         판매금액,
-        최종폐기: 폐기수량,
+        폐기수량,
         폐기금액,
       });
     });
@@ -273,7 +254,6 @@ function buildOpeningStocks(prev2Rows, prevRows) {
 
   function ensure(branch, item) {
     const key = makeStockKey(branch, item);
-
     if (!map.has(key)) {
       map.set(key, {
         지점명: branch,
@@ -284,20 +264,19 @@ function buildOpeningStocks(prev2Rows, prevRows) {
         전년금액: 0,
       });
     }
-
     return map.get(key);
   }
 
-  prev2Rows.forEach((row) => {
-    const target = ensure(row.지점명, row.품목);
-    target.전전년수량 += roundNumber(row.수량);
-    target.전전년금액 += roundNumber(row.금액);
+  prev2Rows.forEach((r) => {
+    const x = ensure(r.지점명, r.품목);
+    x.전전년수량 += roundNumber(r.수량);
+    x.전전년금액 += roundNumber(r.금액);
   });
 
-  prevRows.forEach((row) => {
-    const target = ensure(row.지점명, row.품목);
-    target.전년수량 += roundNumber(row.수량);
-    target.전년금액 += roundNumber(row.금액);
+  prevRows.forEach((r) => {
+    const x = ensure(r.지점명, r.품목);
+    x.전년수량 += roundNumber(r.수량);
+    x.전년금액 += roundNumber(r.금액);
   });
 
   return map;
@@ -337,13 +316,109 @@ function createDailyCombinedRow(branch, date, item) {
   };
 }
 
+function distributeAmountByQty(totalAmt, parts, target) {
+  const amt = roundNumber(totalAmt);
+
+  parts.forEach((p) => {
+    target[p.amtField] = 0;
+  });
+
+  const valid = parts.filter((p) => roundNumber(p.qty) > 0);
+
+  if (amt <= 0 || !valid.length) return;
+
+  if (valid.length === 1) {
+    target[valid[0].amtField] = amt;
+    return;
+  }
+
+  if (amt < valid.length) {
+    const sorted = [...valid].sort((a, b) => roundNumber(b.qty) - roundNumber(a.qty));
+    let remain = amt;
+
+    sorted.forEach((p) => {
+      if (remain > 0) {
+        target[p.amtField] = 1;
+        remain -= 1;
+      }
+    });
+
+    return;
+  }
+
+  valid.forEach((p) => {
+    target[p.amtField] = 1;
+  });
+
+  let remainAmt = amt - valid.length;
+  const totalQty = valid.reduce((s, p) => s + roundNumber(p.qty), 0);
+
+  const temp = valid.map((p) => {
+    const exact = (remainAmt * roundNumber(p.qty)) / totalQty;
+    const base = Math.floor(exact);
+    return { ...p, base, frac: exact - base };
+  });
+
+  let assigned = 0;
+
+  temp.forEach((p) => {
+    target[p.amtField] += p.base;
+    assigned += p.base;
+  });
+
+  let leftover = remainAmt - assigned;
+
+  temp.sort((a, b) => b.frac - a.frac);
+
+  let i = 0;
+  while (leftover > 0 && temp.length) {
+    target[temp[i % temp.length].amtField] += 1;
+    leftover -= 1;
+    i += 1;
+  }
+
+  const allocated = valid.reduce((s, p) => s + roundNumber(target[p.amtField]), 0);
+  const diff = amt - allocated;
+
+  if (diff !== 0) {
+    const receiver =
+      valid.find((p) => String(p.amtField).includes("당해") || p.amtField === "currentAmt") ||
+      valid.find((p) => String(p.amtField).includes("전년") || p.amtField === "prevAmt") ||
+      valid[0];
+
+    target[receiver.amtField] += diff;
+  }
+
+  parts.forEach((p) => {
+    if (roundNumber(p.qty) <= 0) target[p.amtField] = 0;
+    if (roundNumber(target[p.amtField]) < 0) target[p.amtField] = 0;
+  });
+}
+
+function normalizeDetailRowAmounts(row) {
+  const fixed = { ...row };
+
+  distributeAmountByQty(
+    fixed.총사용금액,
+    [
+      { qty: fixed.전전년사용수량, amtField: "전전년사용금액" },
+      { qty: fixed.전년사용수량, amtField: "전년사용금액" },
+      { qty: fixed.당해사용수량, amtField: "당해사용금액" },
+    ],
+    fixed
+  );
+
+  return fixed;
+}
+
 function parseLockedDetailRows(workbook, sheetName, type) {
   if (!workbook) return [];
 
   const ws = workbook.Sheets[sheetName];
   if (!ws || !ws["!ref"]) return [];
 
-  return XLSX.utils.sheet_to_json(ws, { defval: "" })
+  return XLSX.utils
+    .sheet_to_json(ws, { defval: "" })
     .map((r) => ({
       구분: normalizeText(r.구분) || `${type}_기존제출`,
       지점명: normalizeText(r.지점명),
@@ -365,7 +440,8 @@ function parseLockedDetailRows(workbook, sheetName, type) {
       부족수량: 0,
       부족금액: 0,
     }))
-    .filter((r) => r.지점명 && r.날짜 && r.품목);
+    .filter((r) => r.지점명 && r.날짜 && r.품목)
+    .map(normalizeDetailRowAmounts);
 }
 
 function parseLockedDailyRows(workbook) {
@@ -374,7 +450,8 @@ function parseLockedDailyRows(workbook) {
   const ws = workbook.Sheets["일별통합결과"];
   if (!ws || !ws["!ref"]) return [];
 
-  return XLSX.utils.sheet_to_json(ws, { defval: "" })
+  return XLSX.utils
+    .sheet_to_json(ws, { defval: "" })
     .map((r) => ({
       지점명: normalizeText(r.지점명),
       일자: formatDate(r.일자),
@@ -403,8 +480,8 @@ function parseLockedDailyRows(workbook) {
       당해_폐기수량: roundNumber(r.당해_폐기수량 ?? r.당월_폐기수량),
       당해_폐기금액: roundNumber(r.당해_폐기금액 ?? r.당월_폐기금액),
 
-      부족수량: roundNumber(r.부족수량),
-      부족금액: roundNumber(r.부족금액),
+      부족수량: 0,
+      부족금액: 0,
     }))
     .filter((r) => r.지점명 && r.일자 && r.품목군);
 }
@@ -425,48 +502,42 @@ function buildLockedDailyMap(workbook) {
   sales.forEach((r) => {
     const row = ensure(r.지점명, r.날짜, r.품목);
 
-    row.판매수량 += roundNumber(r.총사용수량);
-    row.판매금액 += roundNumber(r.총사용금액);
+    row.판매수량 += r.총사용수량;
+    row.판매금액 += r.총사용금액;
 
-    row.전전년_판매수량 += roundNumber(r.전전년사용수량);
-    row.전전년_판매금액 += roundNumber(r.전전년사용금액);
+    row.전전년_판매수량 += r.전전년사용수량;
+    row.전전년_판매금액 += r.전전년사용금액;
 
-    row.전년_판매수량 += roundNumber(r.전년사용수량);
-    row.전년_판매금액 += roundNumber(r.전년사용금액);
+    row.전년_판매수량 += r.전년사용수량;
+    row.전년_판매금액 += r.전년사용금액;
 
-    row.당해_판매수량 += roundNumber(r.당해사용수량);
-    row.당해_판매금액 += roundNumber(r.당해사용금액);
+    row.당해_판매수량 += r.당해사용수량;
+    row.당해_판매금액 += r.당해사용금액;
   });
 
   discards.forEach((r) => {
     const row = ensure(r.지점명, r.날짜, r.품목);
 
-    row.폐기수량 += roundNumber(r.총사용수량);
-    row.폐기금액 += roundNumber(r.총사용금액);
+    row.폐기수량 += r.총사용수량;
+    row.폐기금액 += r.총사용금액;
 
-    row.전전년_폐기수량 += roundNumber(r.전전년사용수량);
-    row.전전년_폐기금액 += roundNumber(r.전전년사용금액);
+    row.전전년_폐기수량 += r.전전년사용수량;
+    row.전전년_폐기금액 += r.전전년사용금액;
 
-    row.전년_폐기수량 += roundNumber(r.전년사용수량);
-    row.전년_폐기금액 += roundNumber(r.전년사용금액);
+    row.전년_폐기수량 += r.전년사용수량;
+    row.전년_폐기금액 += r.전년사용금액;
 
-    row.당해_폐기수량 += roundNumber(r.당해사용수량);
-    row.당해_폐기금액 += roundNumber(r.당해사용금액);
+    row.당해_폐기수량 += r.당해사용수량;
+    row.당해_폐기금액 += r.당해사용금액;
   });
 
   if (map.size === 0) {
     parseLockedDailyRows(workbook).forEach((r) => {
-      const key = makeDailyKey(r.지점명, r.일자, r.품목군);
-      map.set(key, { ...r });
+      map.set(makeDailyKey(r.지점명, r.일자, r.품목군), { ...r });
     });
   }
 
-  for (const row of map.values()) {
-    row.총사용수량 = roundNumber(row.판매수량) + roundNumber(row.폐기수량);
-    row.총사용금액 = roundNumber(row.판매금액) + roundNumber(row.폐기금액);
-    row.부족수량 = 0;
-    row.부족금액 = 0;
-  }
+  for (const row of map.values()) finalizeDailyRow(row);
 
   return map;
 }
@@ -493,7 +564,7 @@ function buildCurrentDailyRows(mainRows) {
 
     row.판매수량 += roundNumber(r.판매수량);
     row.판매금액 += roundNumber(r.판매금액);
-    row.폐기수량 += roundNumber(r.최종폐기);
+    row.폐기수량 += roundNumber(r.폐기수량);
     row.폐기금액 += roundNumber(r.폐기금액);
   });
 
@@ -508,10 +579,10 @@ function buildLockedCompareMap(workbook) {
 
   for (const [key, row] of lockedDailyMap.entries()) {
     map.set(key, {
-      판매수량: roundNumber(row.판매수량),
-      판매금액: roundNumber(row.판매금액),
-      폐기수량: roundNumber(row.폐기수량),
-      폐기금액: roundNumber(row.폐기금액),
+      판매수량: row.판매수량,
+      판매금액: row.판매금액,
+      폐기수량: row.폐기수량,
+      폐기금액: row.폐기금액,
     });
   }
 
@@ -529,11 +600,11 @@ function buildDeltaRows(currentRows, workbookForLocked) {
     const key = makeDailyKey(r.지점명, r.날짜, r.품목);
     const locked = lockedMap.get(key) || {};
 
-    const deltaSaleQty = Math.max(0, roundNumber(r.판매수량) - roundNumber(locked.판매수량));
-    const deltaSaleAmt = Math.max(0, roundNumber(r.판매금액) - roundNumber(locked.판매금액));
+    const deltaSaleQty = Math.max(0, r.판매수량 - roundNumber(locked.판매수량));
+    const deltaSaleAmt = Math.max(0, r.판매금액 - roundNumber(locked.판매금액));
 
-    const deltaDiscardQty = Math.max(0, roundNumber(r.폐기수량) - roundNumber(locked.폐기수량));
-    const deltaDiscardAmt = Math.max(0, roundNumber(r.폐기금액) - roundNumber(locked.폐기금액));
+    const deltaDiscardQty = Math.max(0, r.폐기수량 - roundNumber(locked.폐기수량));
+    const deltaDiscardAmt = Math.max(0, r.폐기금액 - roundNumber(locked.폐기금액));
 
     if (deltaSaleQty === 0 && deltaSaleAmt === 0 && deltaDiscardQty === 0 && deltaDiscardAmt === 0) return;
 
@@ -558,83 +629,205 @@ function filterRowsByFinalCutoff(rows) {
   return rows.filter((row) => normalizeText(row.날짜) <= cutoff);
 }
 
-function moveOrphanAmount(row, fields) {
-  fields.forEach(([qtyField, amtField]) => {
-    const qty = roundNumber(row[qtyField]);
-    const amt = roundNumber(row[amtField]);
+function buildUsedStockMapFromLocked(workbook) {
+  const map = new Map();
+  if (!workbook) return map;
 
-    if (qty <= 0 && amt > 0) {
-      const receiver = fields.find(([q]) => roundNumber(row[q]) > 0);
-
-      if (receiver) {
-        row[receiver[1]] = roundNumber(row[receiver[1]]) + amt;
-      }
-
-      row[amtField] = 0;
+  function ensure(branch, item) {
+    const key = makeStockKey(branch, item);
+    if (!map.has(key)) {
+      map.set(key, {
+        prev2Qty: 0,
+        prev2Amt: 0,
+        prevQty: 0,
+        prevAmt: 0,
+      });
     }
+    return map.get(key);
+  }
+
+  [
+    ...parseLockedDetailRows(workbook, "판매자동소진", "판매"),
+    ...parseLockedDetailRows(workbook, "폐기자동소진", "폐기"),
+  ].forEach((r) => {
+    const x = ensure(r.지점명, r.품목);
+
+    x.prev2Qty += r.전전년사용수량;
+    x.prev2Amt += r.전전년사용금액;
+
+    x.prevQty += r.전년사용수량;
+    x.prevAmt += r.전년사용금액;
+  });
+
+  if (map.size > 0) return map;
+
+  parseLockedDailyRows(workbook).forEach((r) => {
+    const x = ensure(r.지점명, r.품목군);
+
+    x.prev2Qty += r.전전년_판매수량 + r.전전년_폐기수량;
+    x.prev2Amt += r.전전년_판매금액 + r.전전년_폐기금액;
+
+    x.prevQty += r.전년_판매수량 + r.전년_폐기수량;
+    x.prevAmt += r.전년_판매금액 + r.전년_폐기금액;
+  });
+
+  return map;
+}
+
+function buildAllocationStockMap(stockMap, workbook) {
+  const used = buildUsedStockMapFromLocked(workbook);
+  const map = new Map();
+
+  for (const [key, stock] of stockMap.entries()) {
+    const u = used.get(key) || {};
+
+    map.set(key, {
+      ...stock,
+
+      전전년수량: Math.max(0, roundNumber(stock.전전년수량) - roundNumber(u.prev2Qty)),
+      전전년금액: Math.max(0, roundNumber(stock.전전년금액) - roundNumber(u.prev2Amt)),
+
+      전년수량: Math.max(0, roundNumber(stock.전년수량) - roundNumber(u.prevQty)),
+      전년금액: Math.max(0, roundNumber(stock.전년금액) - roundNumber(u.prevAmt)),
+    });
+  }
+
+  return map;
+}
+
+function makeEntry(type, branch, item, date, qty, amt) {
+  return {
+    type,
+    branch,
+    item,
+    date,
+    qty: roundNumber(qty),
+    amt: roundNumber(amt),
+    remainQty: roundNumber(qty),
+
+    prev2Qty: 0,
+    prev2Amt: 0,
+
+    prevQty: 0,
+    prevAmt: 0,
+
+    currentQty: 0,
+    currentAmt: 0,
+
+    shortageQty: 0,
+    shortageAmt: 0,
+  };
+}
+
+function allocateSequentialFIFO(entries, stockQty, resultField, dateLimit) {
+  let remainStock = Math.max(0, roundNumber(stockQty));
+
+  for (const e of entries) {
+    if (dateLimit && normalizeText(e.date) > dateLimit) continue;
+    if (remainStock <= 0) break;
+    if (roundNumber(e.remainQty) <= 0) continue;
+
+    const useQty = Math.min(roundNumber(e.remainQty), remainStock);
+
+    e[resultField] += useQty;
+    e.remainQty -= useQty;
+    remainStock -= useQty;
+  }
+}
+
+function allocateEntryAmounts(entries) {
+  entries.forEach((e) => {
+    distributeAmountByQty(
+      e.amt,
+      [
+        { qty: e.prev2Qty, amtField: "prev2Amt" },
+        { qty: e.prevQty, amtField: "prevAmt" },
+        { qty: e.currentQty, amtField: "currentAmt" },
+      ],
+      e
+    );
   });
 }
 
-function fillMissingAmountFromDiff(row, totalAmtField, fields) {
-  const totalAmt = roundNumber(row[totalAmtField]);
-  const allocated = fields.reduce((sum, [, amtField]) => sum + roundNumber(row[amtField]), 0);
-  let diff = totalAmt - allocated;
+function allocateGroupPeriod(entries, stock) {
+  entries.sort((a, b) => {
+    if (a.date !== b.date) return a.date.localeCompare(b.date);
+    if (a.type !== b.type) return a.type === "판매" ? -1 : 1;
+    return 0;
+  });
 
-  if (diff > 0) {
-    const zeroAmountReceiver = fields.find(([qtyField, amtField]) => {
-      return roundNumber(row[qtyField]) > 0 && roundNumber(row[amtField]) <= 0;
-    });
+  allocateSequentialFIFO(entries, stock?.전전년수량 || 0, "prev2Qty", getPrev2CutoffDate());
+  allocateSequentialFIFO(entries, stock?.전년수량 || 0, "prevQty", getPrevCutoffDate());
 
-    const normalReceiver = fields.find(([qtyField]) => roundNumber(row[qtyField]) > 0);
-    const receiver = zeroAmountReceiver || normalReceiver;
+  entries.forEach((e) => {
+    e.currentQty = Math.max(0, roundNumber(e.remainQty));
+    e.remainQty = 0;
+  });
 
-    if (receiver) {
-      row[receiver[1]] = roundNumber(row[receiver[1]]) + diff;
+  allocateEntryAmounts(entries);
+}
+
+function buildDeltaEntries(deltaRows, allocationStockMap) {
+  const groupMap = new Map();
+
+  deltaRows.forEach((r) => {
+    const key = makeStockKey(r.지점명, r.품목);
+
+    if (!groupMap.has(key)) groupMap.set(key, []);
+
+    if (roundNumber(r.판매수량) > 0 && roundNumber(r.판매금액) > 0) {
+      groupMap.get(key).push(makeEntry("판매", r.지점명, r.품목, r.날짜, r.판매수량, r.판매금액));
     }
+
+    if (roundNumber(r.폐기수량) > 0 && roundNumber(r.폐기금액) > 0) {
+      groupMap.get(key).push(makeEntry("폐기", r.지점명, r.품목, r.날짜, r.폐기수량, r.폐기금액));
+    }
+  });
+
+  for (const [key, entries] of groupMap.entries()) {
+    allocateGroupPeriod(entries, allocationStockMap.get(key));
   }
 
-  if (diff < 0) {
-    let over = Math.abs(diff);
+  return groupMap;
+}
 
-    const reducers = [...fields]
-      .filter(([qtyField, amtField]) => roundNumber(row[qtyField]) > 0 && roundNumber(row[amtField]) > 0)
-      .sort((a, b) => roundNumber(row[b[1]]) - roundNumber(row[a[1]]));
+function finalizeDailyRow(row) {
+  row.판매수량 = roundNumber(row.판매수량);
+  row.판매금액 = roundNumber(row.판매금액);
+  row.폐기수량 = roundNumber(row.폐기수량);
+  row.폐기금액 = roundNumber(row.폐기금액);
 
-    for (const [, amtField] of reducers) {
-      if (over <= 0) break;
+  row.총사용수량 = row.판매수량 + row.폐기수량;
+  row.총사용금액 = row.판매금액 + row.폐기금액;
 
-      const currentAmt = roundNumber(row[amtField]);
-      const cut = Math.min(currentAmt, over);
+  row.부족수량 = 0;
+  row.부족금액 = 0;
 
-      row[amtField] = currentAmt - cut;
-      over -= cut;
-    }
-  }
+  fixDailyRowQtyAmountPairs(row);
+
+  return row;
 }
 
 function fixDailyRowQtyAmountPairs(row) {
-  const saleFields = [
-    ["당해_판매수량", "당해_판매금액"],
-    ["전년_판매수량", "전년_판매금액"],
-    ["전전년_판매수량", "전전년_판매금액"],
-  ];
+  distributeAmountByQty(
+    row.판매금액,
+    [
+      { qty: row.전전년_판매수량, amtField: "전전년_판매금액" },
+      { qty: row.전년_판매수량, amtField: "전년_판매금액" },
+      { qty: row.당해_판매수량, amtField: "당해_판매금액" },
+    ],
+    row
+  );
 
-  const discardFields = [
-    ["당해_폐기수량", "당해_폐기금액"],
-    ["전년_폐기수량", "전년_폐기금액"],
-    ["전전년_폐기수량", "전전년_폐기금액"],
-  ];
-
-  moveOrphanAmount(row, saleFields);
-  moveOrphanAmount(row, discardFields);
-
-  fillMissingAmountFromDiff(row, "판매금액", saleFields);
-  fillMissingAmountFromDiff(row, "폐기금액", discardFields);
-
-  [...saleFields, ...discardFields].forEach(([qtyField, amtField]) => {
-    if (roundNumber(row[qtyField]) <= 0) row[amtField] = 0;
-    if (roundNumber(row[amtField]) < 0) row[amtField] = 0;
-  });
+  distributeAmountByQty(
+    row.폐기금액,
+    [
+      { qty: row.전전년_폐기수량, amtField: "전전년_폐기금액" },
+      { qty: row.전년_폐기수량, amtField: "전년_폐기금액" },
+      { qty: row.당해_폐기수량, amtField: "당해_폐기금액" },
+    ],
+    row
+  );
 
   return row;
 }
@@ -645,74 +838,68 @@ function hasPairError(qty, amt) {
   return (qty > 0 && amt <= 0) || (qty <= 0 && amt > 0);
 }
 
-function addDeltaRowsAsCurrent(mergedMap, deltaRows, salesRows, discardRows) {
-  deltaRows.forEach((r) => {
-    const key = makeDailyKey(r.지점명, r.날짜, r.품목);
+function addDeltaEntriesToResults(mergedMap, groupMap, salesRows, discardRows) {
+  for (const entries of groupMap.values()) {
+    entries.forEach((e) => {
+      const key = makeDailyKey(e.branch, e.date, e.item);
 
-    if (!mergedMap.has(key)) {
-      mergedMap.set(key, createDailyCombinedRow(r.지점명, r.날짜, r.품목));
-    }
+      if (!mergedMap.has(key)) mergedMap.set(key, createDailyCombinedRow(e.branch, e.date, e.item));
 
-    const row = mergedMap.get(key);
+      const row = mergedMap.get(key);
 
-    if (roundNumber(r.판매수량) > 0 || roundNumber(r.판매금액) > 0) {
-      const qty = roundNumber(r.판매수량);
-      const amt = roundNumber(r.판매금액);
+      const detail = {
+        구분: `${e.type}_증가분`,
+        지점명: e.branch,
+        날짜: e.date,
+        품목: e.item,
 
-      row.판매수량 += qty;
-      row.판매금액 += amt;
-      row.당해_판매수량 += qty;
-      row.당해_판매금액 += amt;
+        총사용수량: e.qty,
+        총사용금액: e.amt,
 
-      if (qty > 0 && amt > 0) {
-        salesRows.push({
-          구분: "판매_증가분_당해",
-          지점명: r.지점명,
-          날짜: r.날짜,
-          품목: r.품목,
-          총사용수량: qty,
-          총사용금액: amt,
-          전전년사용수량: 0,
-          전전년사용금액: 0,
-          전년사용수량: 0,
-          전년사용금액: 0,
-          당해사용수량: qty,
-          당해사용금액: amt,
-          부족수량: 0,
-          부족금액: 0,
-        });
+        전전년사용수량: e.prev2Qty,
+        전전년사용금액: e.prev2Amt,
+
+        전년사용수량: e.prevQty,
+        전년사용금액: e.prevAmt,
+
+        당해사용수량: e.currentQty,
+        당해사용금액: e.currentAmt,
+
+        부족수량: 0,
+        부족금액: 0,
+      };
+
+      if (e.type === "판매") {
+        row.판매수량 += e.qty;
+        row.판매금액 += e.amt;
+
+        row.전전년_판매수량 += e.prev2Qty;
+        row.전전년_판매금액 += e.prev2Amt;
+
+        row.전년_판매수량 += e.prevQty;
+        row.전년_판매금액 += e.prevAmt;
+
+        row.당해_판매수량 += e.currentQty;
+        row.당해_판매금액 += e.currentAmt;
+
+        salesRows.push(detail);
+      } else {
+        row.폐기수량 += e.qty;
+        row.폐기금액 += e.amt;
+
+        row.전전년_폐기수량 += e.prev2Qty;
+        row.전전년_폐기금액 += e.prev2Amt;
+
+        row.전년_폐기수량 += e.prevQty;
+        row.전년_폐기금액 += e.prevAmt;
+
+        row.당해_폐기수량 += e.currentQty;
+        row.당해_폐기금액 += e.currentAmt;
+
+        discardRows.push(detail);
       }
-    }
-
-    if (roundNumber(r.폐기수량) > 0 || roundNumber(r.폐기금액) > 0) {
-      const qty = roundNumber(r.폐기수량);
-      const amt = roundNumber(r.폐기금액);
-
-      row.폐기수량 += qty;
-      row.폐기금액 += amt;
-      row.당해_폐기수량 += qty;
-      row.당해_폐기금액 += amt;
-
-      if (qty > 0 && amt > 0) {
-        discardRows.push({
-          구분: "폐기_증가분_당해",
-          지점명: r.지점명,
-          날짜: r.날짜,
-          품목: r.품목,
-          총사용수량: qty,
-          총사용금액: amt,
-          전전년사용수량: 0,
-          전전년사용금액: 0,
-          전년사용수량: 0,
-          전년사용금액: 0,
-          당해사용수량: qty,
-          당해사용금액: amt,
-          부족수량: 0,
-          부족금액: 0,
-        });
-      }
-    }
-  });
+    });
+  }
 }
 
 function buildStockUseMapFromDailyRows(dailyRows) {
@@ -755,6 +942,7 @@ function buildStockBalanceRows(stockMap, dailyRows) {
 
     const prev2UsedQty = roundNumber(used.전전년사용수량);
     const prevUsedQty = roundNumber(used.전년사용수량);
+
     const prev2UsedAmt = roundNumber(used.전전년사용금액);
     const prevUsedAmt = roundNumber(used.전년사용금액);
 
@@ -866,7 +1054,8 @@ function validateAnomalies(rows) {
 
     const saleQty = roundNumber(row.판매수량);
     const saleAmt = roundNumber(row.판매금액);
-    const discardQty = roundNumber(row.폐기수량 ?? row.최종폐기);
+
+    const discardQty = roundNumber(row.폐기수량);
     const discardAmt = roundNumber(row.폐기금액);
 
     if (saleQty > 0 && saleAmt === 0) {
@@ -893,35 +1082,26 @@ function processWorkbook(workbook) {
   const rawRows = parseHorizontal2025Sheet(workbook);
   const filteredRows = filterRowsByFinalCutoff(rawRows);
 
-  const prev2Rows = parseInventorySheetFixed(workbook, PREV2_SHEET);
-  const prevRows = parseInventorySheetFixed(workbook, PREV_SHEET);
-  const stockMap = buildOpeningStocks(prev2Rows, prevRows);
+  const stockMap = buildOpeningStocks(
+    parseInventorySheetFixed(workbook, PREV2_SHEET),
+    parseInventorySheetFixed(workbook, PREV_SHEET)
+  );
+
+  const allocationStockMap = buildAllocationStockMap(stockMap, lockedWorkbook);
 
   const deltaRows = buildDeltaRows(filteredRows, lockedWorkbook);
   const anomalyIssues = validateAnomalies(deltaRows);
 
+  const deltaGroupMap = buildDeltaEntries(deltaRows, allocationStockMap);
+
   const mergedMap = buildLockedDailyMap(lockedWorkbook);
+
   const salesRows = parseLockedDetailRows(lockedWorkbook, "판매자동소진", "판매");
   const discardRows = parseLockedDetailRows(lockedWorkbook, "폐기자동소진", "폐기");
 
-  addDeltaRowsAsCurrent(mergedMap, deltaRows, salesRows, discardRows);
+  addDeltaEntriesToResults(mergedMap, deltaGroupMap, salesRows, discardRows);
 
-  const mergedDailyRows = sortRowsByBusinessOrder(Array.from(mergedMap.values())).map((row) => {
-    row.판매수량 = roundNumber(row.판매수량);
-    row.판매금액 = roundNumber(row.판매금액);
-    row.폐기수량 = roundNumber(row.폐기수량);
-    row.폐기금액 = roundNumber(row.폐기금액);
-
-    row.총사용수량 = row.판매수량 + row.폐기수량;
-    row.총사용금액 = row.판매금액 + row.폐기금액;
-
-    row.부족수량 = 0;
-    row.부족금액 = 0;
-
-    fixDailyRowQtyAmountPairs(row);
-
-    return row;
-  });
+  const mergedDailyRows = sortRowsByBusinessOrder(Array.from(mergedMap.values())).map(finalizeDailyRow);
 
   const stockBalanceRows = buildStockBalanceRows(stockMap, mergedDailyRows);
   const remainStockRows = buildOnlyRemainStockRows(stockBalanceRows);
@@ -940,39 +1120,6 @@ function processWorkbook(workbook) {
   };
 }
 
-function createTable(rows, maxRows = 300) {
-  if (!rows || !rows.length) return "<p>데이터가 없습니다.</p>";
-
-  const limitedRows = rows.slice(0, maxRows);
-  const cols = Object.keys(limitedRows[0]);
-
-  let html = "";
-
-  if (rows.length > maxRows) {
-    html += `<p style="margin:0 0 12px; color:#6b7280; font-size:13px;">
-      총 ${rows.length.toLocaleString()}행 중 ${maxRows.toLocaleString()}행만 화면에 표시합니다.
-      전체 데이터는 엑셀 다운로드에서 확인하세요.
-    </p>`;
-  }
-
-  html += "<table><thead><tr>";
-  cols.forEach((c) => {
-    html += `<th>${c}</th>`;
-  });
-  html += "</tr></thead><tbody>";
-
-  limitedRows.forEach((row) => {
-    html += "<tr>";
-    cols.forEach((c) => {
-      html += `<td>${row[c] ?? ""}</td>`;
-    });
-    html += "</tr>";
-  });
-
-  html += "</tbody></table>";
-  return html;
-}
-
 function validationHasError(r) {
   return (
     roundNumber(r.수량차이) !== 0 ||
@@ -988,18 +1135,49 @@ function validationHasError(r) {
   );
 }
 
+function createTable(rows, maxRows = 300) {
+  if (!rows || !rows.length) return "<p>데이터가 없습니다.</p>";
+
+  const limitedRows = rows.slice(0, maxRows);
+  const cols = Object.keys(limitedRows[0]);
+
+  let html = "";
+
+  if (rows.length > maxRows) {
+    html += `<p style="margin:0 0 12px; color:#6b7280; font-size:13px;">총 ${rows.length.toLocaleString()}행 중 ${maxRows.toLocaleString()}행만 화면에 표시합니다. 전체 데이터는 엑셀 다운로드에서 확인하세요.</p>`;
+  }
+
+  html += "<table><thead><tr>";
+
+  cols.forEach((c) => {
+    html += `<th>${c}</th>`;
+  });
+
+  html += "</tr></thead><tbody>";
+
+  limitedRows.forEach((row) => {
+    html += "<tr>";
+    cols.forEach((c) => {
+      html += `<td>${row[c] ?? ""}</td>`;
+    });
+    html += "</tr>";
+  });
+
+  html += "</tbody></table>";
+
+  return html;
+}
+
 function renderIssues(result) {
   const container = document.getElementById("issues");
   if (!container) return;
 
   container.innerHTML = "";
 
-  const validationErrors = result.validationRows
-    .filter(validationHasError)
-    .map((r) => ({
-      유형: "검증오류",
-      내용: `${r.지점명} / ${r.날짜} / ${r.품목}: 수량차이 ${r.수량차이}, 금액차이 ${r.금액차이}`,
-    }));
+  const validationErrors = result.validationRows.filter(validationHasError).map((r) => ({
+    유형: "검증오류",
+    내용: `${r.지점명} / ${r.날짜} / ${r.품목}: 수량차이 ${r.수량차이}, 금액차이 ${r.금액차이}, 전전년초과 ${r.전전년재고초과}, 전년초과 ${r.전년재고초과}`,
+  }));
 
   const issues = [...result.anomalyIssues, ...validationErrors];
 
@@ -1031,6 +1209,7 @@ function populateBranchFilter(result) {
   });
 
   const current = select.value || "전체";
+
   select.innerHTML = `<option value="전체">전체</option>`;
 
   Array.from(branches)
@@ -1078,10 +1257,7 @@ function updateStats(result) {
   if (discardCount) discardCount.textContent = result.discardRows.length;
 
   const issueCount = document.getElementById("issueCount");
-  if (issueCount) {
-    issueCount.textContent =
-      result.anomalyIssues.length + result.validationRows.filter(validationHasError).length;
-  }
+  if (issueCount) issueCount.textContent = result.anomalyIssues.length + result.validationRows.filter(validationHasError).length;
 
   const shortageCount = document.getElementById("shortageCount");
   if (shortageCount) shortageCount.textContent = 0;
@@ -1175,9 +1351,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
 
-  document.getElementById("runBtn")?.addEventListener("click", () => {
-    runProcess();
-  });
+  document.getElementById("runBtn")?.addEventListener("click", () => runProcess());
 
   document.getElementById("downloadBtn")?.addEventListener("click", () => {
     if (!latestResult) {
