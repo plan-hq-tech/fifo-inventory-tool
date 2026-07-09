@@ -3,7 +3,7 @@
  *
  * 최종 대전제
  * 1. 기존 제출파일의 전전년 사용수량/금액은 절대 변경하지 않는다.
- * 2. 기존 제출파일의 전년/당해는 수량·금액 짝오류만 보정한다.
+ * 2. 모든 연차별 데이터는 수량과 금액이 반드시 같이 있어야 한다.
  * 3. 기존 제출 이후 증가분은 전부 당해로 처리한다.
  * 4. 전전년/전년 총 사용량은 총 재고 수량·금액을 초과하면 안 된다.
  * 5. 전전년 재고는 기준일까지 소진 목적, 전년 재고는 연말까지 소진 목적이다.
@@ -362,109 +362,12 @@ function createDailyCombinedRow(branch, date, item) {
 }
 
 /*************************************************
- * 금액 배분 유틸
- *************************************************/
-
-function distributeAmountByQty(totalAmt, parts, target) {
-  const amt = roundNumber(totalAmt);
-
-  parts.forEach((p) => {
-    target[p.amtField] = 0;
-  });
-
-  const valid = parts.filter((p) => roundNumber(p.qty) > 0);
-
-  if (amt <= 0 || !valid.length) return;
-
-  if (valid.length === 1) {
-    target[valid[0].amtField] = amt;
-    return;
-  }
-
-  if (amt < valid.length) {
-    const sorted = [...valid].sort((a, b) => roundNumber(b.qty) - roundNumber(a.qty));
-    let remain = amt;
-
-    sorted.forEach((p) => {
-      if (remain > 0) {
-        target[p.amtField] = 1;
-        remain -= 1;
-      }
-    });
-
-    return;
-  }
-
-  valid.forEach((p) => {
-    target[p.amtField] = 1;
-  });
-
-  let remainAmt = amt - valid.length;
-  const totalQty = valid.reduce((s, p) => s + roundNumber(p.qty), 0);
-
-  const temp = valid.map((p) => {
-    const exact = (remainAmt * roundNumber(p.qty)) / totalQty;
-    const base = Math.floor(exact);
-
-    return {
-      ...p,
-      base,
-      frac: exact - base,
-    };
-  });
-
-  let assigned = 0;
-
-  temp.forEach((p) => {
-    target[p.amtField] += p.base;
-    assigned += p.base;
-  });
-
-  let leftover = remainAmt - assigned;
-
-  temp.sort((a, b) => b.frac - a.frac);
-
-  let i = 0;
-  while (leftover > 0 && temp.length) {
-    target[temp[i % temp.length].amtField] += 1;
-    leftover -= 1;
-    i += 1;
-  }
-
-  const allocated = valid.reduce((s, p) => s + roundNumber(target[p.amtField]), 0);
-  const diff = amt - allocated;
-
-  if (diff !== 0) {
-    const receiver =
-      valid.find((p) => String(p.amtField).includes("당해") || p.amtField === "currentAmt") ||
-      valid.find((p) => String(p.amtField).includes("전년") || p.amtField === "prevAmt") ||
-      valid[0];
-
-    target[receiver.amtField] += diff;
-  }
-
-  parts.forEach((p) => {
-    if (roundNumber(p.qty) <= 0) target[p.amtField] = 0;
-    if (roundNumber(target[p.amtField]) < 0) target[p.amtField] = 0;
-  });
-}
-
-/*************************************************
  * 기존 제출 상세행 정리
- * 중요:
- * - 전전년 수량/금액은 절대 변경하지 않음
- * - 전년/당해 금액만 잔여금액 안에서 보정
+ * 전전년 값은 절대 변경하지 않는다.
  *************************************************/
 
 function normalizeLockedDetailRow(row) {
   const fixed = { ...row };
-
-  /*************************************************
-   * 중요
-   * - 기존 제출파일의 전전년사용수량/전전년사용금액은 절대 변경하지 않는다.
-   * - 수량만 있거나 금액만 있는 값도 여기서 자동 보정하지 않는다.
-   * - 오류 여부는 검증 시트에서 표시한다.
-   *************************************************/
 
   fixed.총사용수량 = roundNumber(fixed.총사용수량);
   fixed.총사용금액 = roundNumber(fixed.총사용금액);
@@ -728,7 +631,7 @@ function filterRowsByFinalCutoff(rows) {
  * 증가분은 무조건 당해로 추가
  *************************************************/
 
-function addDeltaRowsAsCurrent(mergedMap, deltaRows, salesRows, discardRows) {
+function addDeltaRowsAsCurrent(mergedMap, deltaRows) {
   deltaRows.forEach((r) => {
     const key = makeDailyKey(r.지점명, r.날짜, r.품목);
 
@@ -738,82 +641,30 @@ function addDeltaRowsAsCurrent(mergedMap, deltaRows, salesRows, discardRows) {
 
     const row = mergedMap.get(key);
 
-    if (roundNumber(r.판매수량) > 0 || roundNumber(r.판매금액) > 0) {
-      const qty = roundNumber(r.판매수량);
-      const amt = roundNumber(r.판매금액);
+    const saleQty = roundNumber(r.판매수량);
+    const saleAmt = roundNumber(r.판매금액);
+    const discardQty = roundNumber(r.폐기수량);
+    const discardAmt = roundNumber(r.폐기금액);
 
-      row.판매수량 += qty;
-      row.판매금액 += amt;
-
-      row.당해_판매수량 += qty;
-      row.당해_판매금액 += amt;
-
-      if (qty > 0 && amt > 0) {
-        salesRows.push({
-          구분: "판매_증가분_당해",
-          지점명: r.지점명,
-          날짜: r.날짜,
-          품목: r.품목,
-
-          총사용수량: qty,
-          총사용금액: amt,
-
-          전전년사용수량: 0,
-          전전년사용금액: 0,
-
-          전년사용수량: 0,
-          전년사용금액: 0,
-
-          당해사용수량: qty,
-          당해사용금액: amt,
-
-          부족수량: 0,
-          부족금액: 0,
-        });
-      }
+    if (saleQty > 0 || saleAmt > 0) {
+      row.판매수량 += saleQty;
+      row.판매금액 += saleAmt;
+      row.당해_판매수량 += saleQty;
+      row.당해_판매금액 += saleAmt;
     }
 
-    if (roundNumber(r.폐기수량) > 0 || roundNumber(r.폐기금액) > 0) {
-      const qty = roundNumber(r.폐기수량);
-      const amt = roundNumber(r.폐기금액);
-
-      row.폐기수량 += qty;
-      row.폐기금액 += amt;
-
-      row.당해_폐기수량 += qty;
-      row.당해_폐기금액 += amt;
-
-      if (qty > 0 && amt > 0) {
-        discardRows.push({
-          구분: "폐기_증가분_당해",
-          지점명: r.지점명,
-          날짜: r.날짜,
-          품목: r.품목,
-
-          총사용수량: qty,
-          총사용금액: amt,
-
-          전전년사용수량: 0,
-          전전년사용금액: 0,
-
-          전년사용수량: 0,
-          전년사용금액: 0,
-
-          당해사용수량: qty,
-          당해사용금액: amt,
-
-          부족수량: 0,
-          부족금액: 0,
-        });
-      }
+    if (discardQty > 0 || discardAmt > 0) {
+      row.폐기수량 += discardQty;
+      row.폐기금액 += discardAmt;
+      row.당해_폐기수량 += discardQty;
+      row.당해_폐기금액 += discardAmt;
     }
   });
 }
 
 /*************************************************
- * 최종 일별 행 보정
- * - 전전년 금액은 고정
- * - 전년/당해 금액만 보정
+ * 최종 일별 행 정리
+ * 전전년/전년/당해 연차별 값은 여기서 임의 재배분하지 않는다.
  *************************************************/
 
 function finalizeDailyRow(row) {
@@ -822,132 +673,38 @@ function finalizeDailyRow(row) {
   row.폐기수량 = roundNumber(row.폐기수량);
   row.폐기금액 = roundNumber(row.폐기금액);
 
+  row.전전년_판매수량 = roundNumber(row.전전년_판매수량);
+  row.전전년_판매금액 = roundNumber(row.전전년_판매금액);
+  row.전전년_폐기수량 = roundNumber(row.전전년_폐기수량);
+  row.전전년_폐기금액 = roundNumber(row.전전년_폐기금액);
+
+  row.전년_판매수량 = roundNumber(row.전년_판매수량);
+  row.전년_판매금액 = roundNumber(row.전년_판매금액);
+  row.전년_폐기수량 = roundNumber(row.전년_폐기수량);
+  row.전년_폐기금액 = roundNumber(row.전년_폐기금액);
+
+  row.당해_판매수량 = roundNumber(row.당해_판매수량);
+  row.당해_판매금액 = roundNumber(row.당해_판매금액);
+  row.당해_폐기수량 = roundNumber(row.당해_폐기수량);
+  row.당해_폐기금액 = roundNumber(row.당해_폐기금액);
+
   row.총사용수량 = row.판매수량 + row.폐기수량;
   row.총사용금액 = row.판매금액 + row.폐기금액;
 
   row.부족수량 = 0;
   row.부족금액 = 0;
 
-  /*************************************************
-   * 중요
-   * 여기서는 연차별 수량/금액을 자동 보정하지 않는다.
-   * 특히 기존 제출파일에서 복원된 전전년 값은 절대 변경하지 않는다.
-   * 수량·금액 짝오류, 총액 불일치, 재고초과는 검증 시트에서 표시한다.
-   *************************************************/
-
-  return row;
-}
-
-function fixDailyRowQtyAmountPairs(row) {
-  /*************************************************
-   * 과거 버전에서는 이 함수가 전전년 금액을 보정했지만,
-   * 최종 대전제에 따라 더 이상 자동 보정하지 않는다.
-   *************************************************/
   return row;
 }
 
 /*************************************************
- * 전년 재고 초과분 처리
- * - 전전년은 고정값이므로 자동수정하지 않고 검증오류 표시
- * - 전년은 초과 시 초과분을 당해로 이동
- *************************************************/
-
-function enforcePrevStockLimit(dailyRows, stockMap) {
-  const grouped = new Map();
-
-  dailyRows.forEach((row) => {
-    const key = makeStockKey(row.지점명, row.품목군);
-    if (!grouped.has(key)) grouped.set(key, []);
-    grouped.get(key).push(row);
-  });
-
-  function movePrevToCurrent(row, type, excessQty, excessAmt) {
-    if (type === "판매") {
-      row.전년_판매수량 -= excessQty;
-      row.전년_판매금액 -= excessAmt;
-      row.당해_판매수량 += excessQty;
-      row.당해_판매금액 += excessAmt;
-    } else {
-      row.전년_폐기수량 -= excessQty;
-      row.전년_폐기금액 -= excessAmt;
-      row.당해_폐기수량 += excessQty;
-      row.당해_폐기금액 += excessAmt;
-    }
-  }
-
-  function consumePrevPart(row, type, qtyField, amtField, remain) {
-    const originalQty = roundNumber(row[qtyField]);
-    const originalAmt = roundNumber(row[amtField]);
-
-    if (originalQty <= 0 && originalAmt <= 0) return;
-
-    let allowedQty = originalQty;
-    let allowedAmt = originalAmt;
-
-    if (originalQty > 0 && originalAmt > 0) {
-      const qtyRatio = remain.qty / originalQty;
-      const amtRatio = remain.amt / originalAmt;
-      const ratio = Math.max(0, Math.min(1, qtyRatio, amtRatio));
-
-      allowedQty = Math.floor(originalQty * ratio);
-      allowedAmt = Math.round(originalAmt * ratio);
-
-      if (ratio > 0 && allowedQty === 0 && remain.qty > 0 && remain.amt > 0) {
-        allowedQty = 1;
-        allowedAmt = Math.max(1, Math.min(originalAmt, remain.amt));
-      }
-
-      if (allowedQty === originalQty) allowedAmt = Math.min(originalAmt, remain.amt);
-      if (allowedAmt === originalAmt) allowedQty = Math.min(originalQty, remain.qty);
-    } else {
-      allowedQty = Math.min(originalQty, remain.qty);
-      allowedAmt = Math.min(originalAmt, remain.amt);
-
-      if (allowedQty > 0 && originalAmt <= 0) allowedAmt = 0;
-      if (allowedAmt > 0 && originalQty <= 0) allowedQty = 0;
-    }
-
-    allowedQty = Math.max(0, Math.min(originalQty, roundNumber(allowedQty), remain.qty));
-    allowedAmt = Math.max(0, Math.min(originalAmt, roundNumber(allowedAmt), remain.amt));
-
-    const excessQty = originalQty - allowedQty;
-    const excessAmt = originalAmt - allowedAmt;
-
-    if (excessQty > 0 || excessAmt > 0) {
-      movePrevToCurrent(row, type, excessQty, excessAmt);
-    }
-
-    remain.qty -= allowedQty;
-    remain.amt -= allowedAmt;
-  }
-
-  for (const [key, rows] of grouped.entries()) {
-    const stock = stockMap.get(key);
-    if (!stock) continue;
-
-    const remain = {
-      qty: Math.max(0, roundNumber(stock.전년수량)),
-      amt: Math.max(0, roundNumber(stock.전년금액)),
-    };
-
-    rows.sort((a, b) => {
-      if (a.일자 !== b.일자) return a.일자.localeCompare(b.일자);
-      return 0;
-    });
-
-    rows.forEach((row) => {
-      consumePrevPart(row, "판매", "전년_판매수량", "전년_판매금액", remain);
-      consumePrevPart(row, "폐기", "전년_폐기수량", "전년_폐기금액", remain);
-      finalizeDailyRow(row);
-    });
-  }
-}
-
-/*************************************************
- * 전년 재고 금액 초과분 처리
- * - 전년 수량은 맞지만 전년 금액만 재고금액을 초과하는 경우 보정
- * - 전년 금액 초과분은 당해 금액으로 이동
- * - 전전년 값은 절대 건드리지 않음
+ * 전년 금액 초과분 조정
+ *
+ * 중요:
+ * - 전년 수량은 기본적으로 건드리지 않는다.
+ * - 당해에 이미 수량이 있으면 금액만 당해로 넘긴다.
+ * - 당해에 수량이 없으면 금액만 넘길 수 없으므로 필요한 수량 일부를 같이 넘긴다.
+ * - 전전년은 절대 건드리지 않는다.
  *************************************************/
 
 function enforcePrevStockAmountLimit(dailyRows, stockMap) {
@@ -959,41 +716,59 @@ function enforcePrevStockAmountLimit(dailyRows, stockMap) {
     grouped.get(key).push(row);
   });
 
+  function getPrevQty(row) {
+    return roundNumber(row.전년_판매수량) + roundNumber(row.전년_폐기수량);
+  }
+
   function getPrevAmt(row) {
     return roundNumber(row.전년_판매금액) + roundNumber(row.전년_폐기금액);
   }
 
-  function movePrevAmtToCurrent(row, part, amount, allowMoveQty) {
+  function movePrevToCurrent(row, part, needAmt, forceMoveQty) {
     const prevQtyField = part === "판매" ? "전년_판매수량" : "전년_폐기수량";
     const prevAmtField = part === "판매" ? "전년_판매금액" : "전년_폐기금액";
-    const currentQtyField = part === "판매" ? "당해_판매수량" : "당해_폐기수량";
-    const currentAmtField = part === "판매" ? "당해_판매금액" : "당해_폐기금액";
+    const curQtyField = part === "판매" ? "당해_판매수량" : "당해_폐기수량";
+    const curAmtField = part === "판매" ? "당해_판매금액" : "당해_폐기금액";
 
-    const prevQty = roundNumber(row[prevQtyField]);
-    const prevAmt = roundNumber(row[prevAmtField]);
-    const currentQty = roundNumber(row[currentQtyField]);
+    let prevQty = roundNumber(row[prevQtyField]);
+    let prevAmt = roundNumber(row[prevAmtField]);
+    let curQty = roundNumber(row[curQtyField]);
 
-    if (amount <= 0 || prevAmt <= 0) return 0;
+    if (needAmt <= 0) return 0;
+    if (prevAmt <= 0) return 0;
 
-    if (!allowMoveQty && currentQty <= 0) return 0;
+    let moveAmt = Math.min(needAmt, prevAmt);
+    let moveQty = 0;
 
-    let movable = Math.min(amount, prevAmt);
+    if (!forceMoveQty && curQty > 0) {
+      moveQty = 0;
 
-    if (prevQty > 0 && prevAmt - movable <= 0) {
-      movable = Math.max(0, prevAmt - 1);
+      if (prevQty > 0 && moveAmt >= prevAmt) {
+        moveAmt = prevAmt - 1;
+      }
+    } else {
+      if (prevQty <= 0) return 0;
+
+      moveQty = Math.max(1, Math.round((prevQty * moveAmt) / prevAmt));
+
+      if (moveQty >= prevQty && moveAmt < prevAmt) {
+        moveQty = prevQty - 1;
+      }
+
+      if (moveQty <= 0) return 0;
     }
 
-    if (movable <= 0) return 0;
+    if (moveAmt <= 0) return 0;
 
-    row[prevAmtField] -= movable;
-    row[currentAmtField] += movable;
+    row[prevAmtField] -= moveAmt;
+    row[curAmtField] += moveAmt;
 
-    if (allowMoveQty && roundNumber(row[currentQtyField]) <= 0 && roundNumber(row[prevQtyField]) > 1) {
-      row[prevQtyField] -= 1;
-      row[currentQtyField] += 1;
+    if (moveQty > 0) {
+      row[prevQtyField] -= moveQty;
+      row[curQtyField] += moveQty;
     }
 
-    return movable;
+    return moveAmt;
   }
 
   for (const [key, rows] of grouped.entries()) {
@@ -1001,6 +776,7 @@ function enforcePrevStockAmountLimit(dailyRows, stockMap) {
     if (!stock) continue;
 
     const prevStockAmt = Math.max(0, roundNumber(stock.전년금액));
+
     let totalPrevAmt = rows.reduce((sum, row) => sum + getPrevAmt(row), 0);
     let excessAmt = totalPrevAmt - prevStockAmt;
 
@@ -1011,18 +787,140 @@ function enforcePrevStockAmountLimit(dailyRows, stockMap) {
       return 0;
     });
 
+    /*************************************************
+     * 1차: 당해 수량이 이미 있는 행은 금액만 이동
+     *************************************************/
     for (const row of reverseRows) {
       if (excessAmt <= 0) break;
-      excessAmt -= movePrevAmtToCurrent(row, "폐기", excessAmt, false);
+      excessAmt -= movePrevToCurrent(row, "폐기", excessAmt, false);
       if (excessAmt <= 0) break;
-      excessAmt -= movePrevAmtToCurrent(row, "판매", excessAmt, false);
+      excessAmt -= movePrevToCurrent(row, "판매", excessAmt, false);
     }
 
+    /*************************************************
+     * 2차: 그래도 초과가 남으면 수량 일부도 같이 이동
+     *************************************************/
     for (const row of reverseRows) {
       if (excessAmt <= 0) break;
-      excessAmt -= movePrevAmtToCurrent(row, "폐기", excessAmt, true);
+      excessAmt -= movePrevToCurrent(row, "폐기", excessAmt, true);
       if (excessAmt <= 0) break;
-      excessAmt -= movePrevAmtToCurrent(row, "판매", excessAmt, true);
+      excessAmt -= movePrevToCurrent(row, "판매", excessAmt, true);
+    }
+
+    rows.forEach(finalizeDailyRow);
+  }
+}
+
+/*************************************************
+ * 전년 재고 최종 초과 방지
+ *
+ * 목적:
+ * - 전년 사용수량 또는 사용금액이 전년 재고를 초과하면 최종적으로 당해로 이동
+ * - 단, 수량은 불필요하게 건드리지 않는다.
+ * - 전년 금액 초과는 금액 우선 이동
+ * - 전년 수량 초과가 실제로 발생한 경우에만 수량과 금액을 같이 이동
+ *************************************************/
+
+function enforcePrevStockFinalCap(dailyRows, stockMap) {
+  const grouped = new Map();
+
+  dailyRows.forEach((row) => {
+    const key = makeStockKey(row.지점명, row.품목군);
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push(row);
+  });
+
+  function getPrevQty(row) {
+    return roundNumber(row.전년_판매수량) + roundNumber(row.전년_폐기수량);
+  }
+
+  function getPrevAmt(row) {
+    return roundNumber(row.전년_판매금액) + roundNumber(row.전년_폐기금액);
+  }
+
+  function moveQtyAndAmt(row, part, needQty, needAmt) {
+    const prevQtyField = part === "판매" ? "전년_판매수량" : "전년_폐기수량";
+    const prevAmtField = part === "판매" ? "전년_판매금액" : "전년_폐기금액";
+    const curQtyField = part === "판매" ? "당해_판매수량" : "당해_폐기수량";
+    const curAmtField = part === "판매" ? "당해_판매금액" : "당해_폐기금액";
+
+    const prevQty = roundNumber(row[prevQtyField]);
+    const prevAmt = roundNumber(row[prevAmtField]);
+
+    if (prevQty <= 0 && prevAmt <= 0) return { qty: 0, amt: 0 };
+
+    let moveQty = 0;
+    let moveAmt = 0;
+
+    if (needQty > 0 && prevQty > 0) {
+      moveQty = Math.min(needQty, prevQty);
+
+      if (prevAmt > 0) {
+        moveAmt = Math.round((prevAmt * moveQty) / prevQty);
+      }
+    }
+
+    if (needAmt > 0 && moveAmt < needAmt && prevAmt > 0) {
+      moveAmt = Math.min(needAmt, prevAmt);
+
+      if (moveQty <= 0 && prevQty > 0) {
+        moveQty = Math.max(1, Math.round((prevQty * moveAmt) / prevAmt));
+      }
+    }
+
+    if (moveQty >= prevQty && moveAmt < prevAmt) {
+      moveQty = prevQty - 1;
+    }
+
+    if (moveAmt >= prevAmt && moveQty < prevQty) {
+      moveAmt = prevAmt - 1;
+    }
+
+    moveQty = Math.max(0, Math.min(moveQty, prevQty));
+    moveAmt = Math.max(0, Math.min(moveAmt, prevAmt));
+
+    if (moveQty <= 0 && moveAmt <= 0) return { qty: 0, amt: 0 };
+
+    row[prevQtyField] -= moveQty;
+    row[prevAmtField] -= moveAmt;
+    row[curQtyField] += moveQty;
+    row[curAmtField] += moveAmt;
+
+    return { qty: moveQty, amt: moveAmt };
+  }
+
+  for (const [key, rows] of grouped.entries()) {
+    const stock = stockMap.get(key);
+    if (!stock) continue;
+
+    const stockQty = Math.max(0, roundNumber(stock.전년수량));
+    const stockAmt = Math.max(0, roundNumber(stock.전년금액));
+
+    const reverseRows = [...rows].sort((a, b) => {
+      if (a.일자 !== b.일자) return b.일자.localeCompare(a.일자);
+      return 0;
+    });
+
+    let totalQty = rows.reduce((s, r) => s + getPrevQty(r), 0);
+    let totalAmt = rows.reduce((s, r) => s + getPrevAmt(r), 0);
+
+    let excessQty = totalQty - stockQty;
+    let excessAmt = totalAmt - stockAmt;
+
+    if (excessQty <= 0 && excessAmt <= 0) continue;
+
+    for (const row of reverseRows) {
+      if (excessQty <= 0 && excessAmt <= 0) break;
+
+      let moved = moveQtyAndAmt(row, "폐기", Math.max(0, excessQty), Math.max(0, excessAmt));
+      excessQty -= moved.qty;
+      excessAmt -= moved.amt;
+
+      if (excessQty <= 0 && excessAmt <= 0) break;
+
+      moved = moveQtyAndAmt(row, "판매", Math.max(0, excessQty), Math.max(0, excessAmt));
+      excessQty -= moved.qty;
+      excessAmt -= moved.amt;
     }
 
     rows.forEach(finalizeDailyRow);
@@ -1256,6 +1154,10 @@ function validateAnomalies(rows) {
   return issues;
 }
 
+/*************************************************
+ * 상세 시트 재생성
+ *************************************************/
+
 function buildDetailRowsFromDailyRows(dailyRows, type) {
   const rows = [];
 
@@ -1331,20 +1233,23 @@ function processWorkbook(workbook) {
 
   const mergedMap = buildLockedDailyMap(lockedWorkbook);
 
-  let salesRows = parseLockedDetailRows(lockedWorkbook, "판매자동소진", "판매");
-  let discardRows = parseLockedDetailRows(lockedWorkbook, "폐기자동소진", "폐기");
-
-  addDeltaRowsAsCurrent(mergedMap, deltaRows, salesRows, discardRows);
+  addDeltaRowsAsCurrent(mergedMap, deltaRows);
 
   let mergedDailyRows = sortRowsByBusinessOrder(Array.from(mergedMap.values())).map(finalizeDailyRow);
 
-  enforcePrevStockLimit(mergedDailyRows, stockMap);
+  /*************************************************
+   * 중요 처리 순서
+   * 1. 전년 금액 초과분을 우선 당해로 이동
+   * 2. 최종적으로 전년 수량/금액 초과가 남지 않도록 확인
+   * 3. 전전년은 절대 수정하지 않음
+   *************************************************/
   enforcePrevStockAmountLimit(mergedDailyRows, stockMap);
+  enforcePrevStockFinalCap(mergedDailyRows, stockMap);
 
   mergedDailyRows = sortRowsByBusinessOrder(mergedDailyRows).map(finalizeDailyRow);
 
-  salesRows = buildDetailRowsFromDailyRows(mergedDailyRows, "판매");
-  discardRows = buildDetailRowsFromDailyRows(mergedDailyRows, "폐기");
+  const salesRows = buildDetailRowsFromDailyRows(mergedDailyRows, "판매");
+  const discardRows = buildDetailRowsFromDailyRows(mergedDailyRows, "폐기");
 
   const stockBalanceRows = buildStockBalanceRows(stockMap, mergedDailyRows);
   const remainStockRows = buildOnlyRemainStockRows(stockBalanceRows);
@@ -1355,8 +1260,8 @@ function processWorkbook(workbook) {
     schemaErrors: [],
     anomalyIssues,
     mergedDailyRows,
-    salesRows: sortRowsByBusinessOrder(salesRows),
-    discardRows: sortRowsByBusinessOrder(discardRows),
+    salesRows,
+    discardRows,
     validationRows,
     stockBalanceRows,
     remainStockRows,
