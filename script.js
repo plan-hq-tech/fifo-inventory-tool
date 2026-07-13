@@ -1013,6 +1013,94 @@ function repairCurrentPairErrors(dailyRows) {
 }
 
 /*************************************************
+ * 당해 소액 금액 보정
+ *
+ * 목적:
+ * - 당해 판매/폐기 수량이 있는데 금액이 1원~999원처럼 너무 작게 남는 것을 방지한다.
+ * - 가능하면 당해 금액을 최소 1,000원 이상으로 만든다.
+ *
+ * 핵심 원칙:
+ * 1. 전전년 값은 절대 건드리지 않는다.
+ * 2. 총사용금액은 변경하지 않는다.
+ * 3. 전년금액을 당해금액으로 이동해서 보정한다.
+ * 4. 전년금액이 부족하면 가능한 만큼만 이동한다.
+ * 5. 전년 수량·금액 쌍오류가 생기지 않도록 필요 시 전년 수량도 같이 당해로 이동한다.
+ *************************************************/
+
+function raiseSmallCurrentAmounts(dailyRows, minAmt = 1000) {
+  function repairPart(row, part) {
+    const prevQtyField = part === "판매" ? "전년_판매수량" : "전년_폐기수량";
+    const prevAmtField = part === "판매" ? "전년_판매금액" : "전년_폐기금액";
+    const curQtyField = part === "판매" ? "당해_판매수량" : "당해_폐기수량";
+    const curAmtField = part === "판매" ? "당해_판매금액" : "당해_폐기금액";
+
+    let prevQty = roundNumber(row[prevQtyField]);
+    let prevAmt = roundNumber(row[prevAmtField]);
+    let curQty = roundNumber(row[curQtyField]);
+    let curAmt = roundNumber(row[curAmtField]);
+
+    // 당해 사용이 없거나 이미 1,000원 이상이면 보정하지 않음
+    if (curQty <= 0 || curAmt <= 0 || curAmt >= minAmt) return;
+
+    // 전년에서 가져올 금액이 없으면 보정 불가
+    if (prevAmt <= 0) return;
+
+    const needAmt = minAmt - curAmt;
+
+    /*************************************************
+     * 1. 전년금액이 충분한 경우
+     * → 필요한 금액만 당해로 이동
+     *************************************************/
+    if (prevAmt > needAmt) {
+      prevAmt -= needAmt;
+      curAmt += needAmt;
+    } else {
+      /*************************************************
+       * 2. 전년금액이 부족한 경우
+       * → 전년금액 전부를 당해로 이동
+       * → 전년에 수량만 남지 않도록 전년 수량도 같이 이동
+       *************************************************/
+      curAmt += prevAmt;
+      prevAmt = 0;
+
+      if (prevQty > 0) {
+        curQty += prevQty;
+        prevQty = 0;
+      }
+    }
+
+    /*************************************************
+     * 3. 보정 후 전년에 수량만 남고 금액이 없으면
+     * → 전년 수량도 당해로 이동
+     *************************************************/
+    if (prevQty > 0 && prevAmt <= 0) {
+      curQty += prevQty;
+      prevQty = 0;
+    }
+
+    /*************************************************
+     * 4. 보정 후 전년에 금액만 남고 수량이 없으면
+     * → 전년 금액도 당해로 이동
+     *************************************************/
+    if (prevAmt > 0 && prevQty <= 0) {
+      curAmt += prevAmt;
+      prevAmt = 0;
+    }
+
+    row[prevQtyField] = Math.max(0, roundNumber(prevQty));
+    row[prevAmtField] = Math.max(0, roundNumber(prevAmt));
+    row[curQtyField] = Math.max(0, roundNumber(curQty));
+    row[curAmtField] = Math.max(0, roundNumber(curAmt));
+  }
+
+  dailyRows.forEach((row) => {
+    repairPart(row, "판매");
+    repairPart(row, "폐기");
+    finalizeDailyRow(row);
+  });
+}
+
+/*************************************************
  * 재고 사용 검증
  *************************************************/
 
@@ -1331,6 +1419,17 @@ function processWorkbook(workbook) {
    *************************************************/
   enforcePrevStockAmountLimit(mergedDailyRows, stockMap);
   enforcePrevStockFinalCap(mergedDailyRows, stockMap);
+  repairCurrentPairErrors(mergedDailyRows);
+
+  /*************************************************
+   * 당해 판매/폐기 금액이 1,000원 미만으로 너무 작게 남는 경우 보정
+   * 전년금액을 당해금액으로 이동하는 방식이므로 총사용금액은 변하지 않는다.
+   *************************************************/
+  raiseSmallCurrentAmounts(mergedDailyRows, 1000);
+  
+  /*************************************************
+   * 소액 보정 후 혹시 생길 수 있는 수량·금액 짝오류를 한 번 더 정리
+   *************************************************/
   repairCurrentPairErrors(mergedDailyRows);
 
   mergedDailyRows = sortRowsByBusinessOrder(mergedDailyRows).map(finalizeDailyRow);
