@@ -1243,6 +1243,395 @@ function buildDetailRowsFromDailyRows(dailyRows, type) {
 }
 
 /*************************************************
+ * 기존 제출파일에서 "값이 있는 연차"만 고정값으로 읽기
+ *
+ * 핵심:
+ * - 값이 0인 칸은 고정값으로 보지 않는다.
+ * - 전전년 값이 있으면 전전년 고정
+ * - 전년 값이 있으면 전년 고정
+ * - 당해 값이 있으면 당해 고정
+ * - 전년/당해가 0이면 아직 배분되지 않은 것으로 보고 이후 재고 기준으로 배분
+ *************************************************/
+
+function buildValueBasedLockMap(workbook) {
+  const map = new Map();
+  if (!workbook) return map;
+
+  const sales = parseLockedDetailRows(workbook, "판매자동소진", "판매");
+  const discards = parseLockedDetailRows(workbook, "폐기자동소진", "폐기");
+
+  function ensure(branch, date, item) {
+    const key = makeDailyKey(branch, date, item);
+
+    if (!map.has(key)) {
+      map.set(key, {
+        지점명: branch,
+        일자: date,
+        품목군: item,
+
+        전전년_판매수량: 0,
+        전전년_판매금액: 0,
+        전전년_폐기수량: 0,
+        전전년_폐기금액: 0,
+
+        전년_판매수량: 0,
+        전년_판매금액: 0,
+        전년_폐기수량: 0,
+        전년_폐기금액: 0,
+
+        당해_판매수량: 0,
+        당해_판매금액: 0,
+        당해_폐기수량: 0,
+        당해_폐기금액: 0,
+
+        hasPrev2Value: false,
+        hasPrevValue: false,
+        hasCurrentValue: false,
+      });
+    }
+
+    return map.get(key);
+  }
+
+  function hasValue(qty, amt) {
+    return roundNumber(qty) !== 0 || roundNumber(amt) !== 0;
+  }
+
+  sales.forEach((r) => {
+    const row = ensure(r.지점명, r.날짜, r.품목);
+
+    if (hasValue(r.전전년사용수량, r.전전년사용금액)) {
+      row.전전년_판매수량 += roundNumber(r.전전년사용수량);
+      row.전전년_판매금액 += roundNumber(r.전전년사용금액);
+      row.hasPrev2Value = true;
+    }
+
+    if (hasValue(r.전년사용수량, r.전년사용금액)) {
+      row.전년_판매수량 += roundNumber(r.전년사용수량);
+      row.전년_판매금액 += roundNumber(r.전년사용금액);
+      row.hasPrevValue = true;
+    }
+
+    if (hasValue(r.당해사용수량, r.당해사용금액)) {
+      row.당해_판매수량 += roundNumber(r.당해사용수량);
+      row.당해_판매금액 += roundNumber(r.당해사용금액);
+      row.hasCurrentValue = true;
+    }
+  });
+
+  discards.forEach((r) => {
+    const row = ensure(r.지점명, r.날짜, r.품목);
+
+    if (hasValue(r.전전년사용수량, r.전전년사용금액)) {
+      row.전전년_폐기수량 += roundNumber(r.전전년사용수량);
+      row.전전년_폐기금액 += roundNumber(r.전전년사용금액);
+      row.hasPrev2Value = true;
+    }
+
+    if (hasValue(r.전년사용수량, r.전년사용금액)) {
+      row.전년_폐기수량 += roundNumber(r.전년사용수량);
+      row.전년_폐기금액 += roundNumber(r.전년사용금액);
+      row.hasPrevValue = true;
+    }
+
+    if (hasValue(r.당해사용수량, r.당해사용금액)) {
+      row.당해_폐기수량 += roundNumber(r.당해사용수량);
+      row.당해_폐기금액 += roundNumber(r.당해사용금액);
+      row.hasCurrentValue = true;
+    }
+  });
+
+  return map;
+}
+
+/*************************************************
+ * 값 기반 고정 + 전년재고 자동 배분
+ *
+ * 처리 원칙:
+ * 1. 기존 제출파일에서 값이 있는 연차만 고정한다.
+ * 2. 값이 없는 전년/당해는 고정하지 않는다.
+ * 3. 현재 RAW 총사용량에서 고정값을 뺀 나머지를 계산한다.
+ * 4. 기존 파일에 전년/당해 값이 이미 있으면 이후 증감분은 당해로 처리한다.
+ * 5. 기존 파일에 전전년 값만 있거나 값이 없으면, 남은 사용량을 전년재고에서 먼저 소진한다.
+ * 6. 전년재고 초과분은 당해로 처리한다.
+ * 7. RAW 감소로 당해가 음수이면 당해 차감 후 부족분만 전년에서 차감한다.
+ * 8. 전전년은 절대 수정하지 않는다.
+ *************************************************/
+
+function buildDailyRowsWithValueBasedLocks(currentDailyRows, lockedWorkbook, stockMap) {
+  const lockMap = buildValueBasedLockMap(lockedWorkbook);
+
+  const currentMap = new Map();
+  currentDailyRows.forEach((r) => {
+    currentMap.set(makeDailyKey(r.지점명, r.날짜, r.품목), r);
+  });
+
+  const allKeys = new Set([...currentMap.keys(), ...lockMap.keys()]);
+  const rows = [];
+
+  allKeys.forEach((key) => {
+    const current = currentMap.get(key);
+    const locked = lockMap.get(key);
+
+    const branch = normalizeText(current?.지점명 || locked?.지점명);
+    const date = normalizeText(current?.날짜 || locked?.일자);
+    const item = normalizeText(current?.품목 || locked?.품목군);
+
+    const row = createDailyCombinedRow(branch, date, item);
+
+    row.판매수량 = roundNumber(current?.판매수량);
+    row.판매금액 = roundNumber(current?.판매금액);
+    row.폐기수량 = roundNumber(current?.폐기수량);
+    row.폐기금액 = roundNumber(current?.폐기금액);
+
+    if (locked) {
+      row.전전년_판매수량 = roundNumber(locked.전전년_판매수량);
+      row.전전년_판매금액 = roundNumber(locked.전전년_판매금액);
+      row.전전년_폐기수량 = roundNumber(locked.전전년_폐기수량);
+      row.전전년_폐기금액 = roundNumber(locked.전전년_폐기금액);
+
+      row.전년_판매수량 = roundNumber(locked.전년_판매수량);
+      row.전년_판매금액 = roundNumber(locked.전년_판매금액);
+      row.전년_폐기수량 = roundNumber(locked.전년_폐기수량);
+      row.전년_폐기금액 = roundNumber(locked.전년_폐기금액);
+
+      row.당해_판매수량 = roundNumber(locked.당해_판매수량);
+      row.당해_판매금액 = roundNumber(locked.당해_판매금액);
+      row.당해_폐기수량 = roundNumber(locked.당해_폐기수량);
+      row.당해_폐기금액 = roundNumber(locked.당해_폐기금액);
+
+      row.__hasPrev2Value = locked.hasPrev2Value;
+      row.__hasPrevValue = locked.hasPrevValue;
+      row.__hasCurrentValue = locked.hasCurrentValue;
+    } else {
+      row.__hasPrev2Value = false;
+      row.__hasPrevValue = false;
+      row.__hasCurrentValue = false;
+    }
+
+    rows.push(finalizeDailyRow(row));
+  });
+
+  /*************************************************
+   * 전년재고 잔여량 계산
+   * 기존 파일에서 전년 값이 실제로 있는 경우에는 이미 전년재고를 사용한 것으로 보고 차감한다.
+   *************************************************/
+
+  const prevRemainMap = new Map();
+
+  for (const [key, stock] of stockMap.entries()) {
+    prevRemainMap.set(key, {
+      qty: Math.max(0, roundNumber(stock.전년수량)),
+      amt: Math.max(0, roundNumber(stock.전년금액)),
+    });
+  }
+
+  rows.forEach((row) => {
+    const key = makeStockKey(row.지점명, row.품목군);
+    if (!prevRemainMap.has(key)) return;
+
+    const remain = prevRemainMap.get(key);
+
+    const usedPrevQty =
+      roundNumber(row.전년_판매수량) + roundNumber(row.전년_폐기수량);
+
+    const usedPrevAmt =
+      roundNumber(row.전년_판매금액) + roundNumber(row.전년_폐기금액);
+
+    remain.qty = Math.max(0, remain.qty - usedPrevQty);
+    remain.amt = Math.max(0, remain.amt - usedPrevAmt);
+  });
+
+  function allocatePositiveToPrev(row, part, remainPrev) {
+    const totalQtyField = part === "판매" ? "판매수량" : "폐기수량";
+    const totalAmtField = part === "판매" ? "판매금액" : "폐기금액";
+
+    const prev2QtyField = part === "판매" ? "전전년_판매수량" : "전전년_폐기수량";
+    const prev2AmtField = part === "판매" ? "전전년_판매금액" : "전전년_폐기금액";
+
+    const prevQtyField = part === "판매" ? "전년_판매수량" : "전년_폐기수량";
+    const prevAmtField = part === "판매" ? "전년_판매금액" : "전년_폐기금액";
+
+    const curQtyField = part === "판매" ? "당해_판매수량" : "당해_폐기수량";
+    const curAmtField = part === "판매" ? "당해_판매금액" : "당해_폐기금액";
+
+    const totalQty = roundNumber(row[totalQtyField]);
+    const totalAmt = roundNumber(row[totalAmtField]);
+
+    const fixedQty =
+      roundNumber(row[prev2QtyField]) +
+      roundNumber(row[prevQtyField]) +
+      roundNumber(row[curQtyField]);
+
+    const fixedAmt =
+      roundNumber(row[prev2AmtField]) +
+      roundNumber(row[prevAmtField]) +
+      roundNumber(row[curAmtField]);
+
+    let remainQty = totalQty - fixedQty;
+    let remainAmt = totalAmt - fixedAmt;
+
+    /*************************************************
+     * 1. 기존 파일에 전년/당해 값이 이미 있으면
+     *    이후 증가분은 당해로만 처리한다.
+     *************************************************/
+    if (remainQty > 0 || remainAmt > 0) {
+      if (row.__hasPrevValue || row.__hasCurrentValue) {
+        row[curQtyField] += remainQty;
+        row[curAmtField] += remainAmt;
+        return;
+      }
+    }
+
+    /*************************************************
+     * 2. 기존 파일에 전전년만 있거나 아무 값이 없으면
+     *    남은 사용량을 전년재고에서 먼저 소진한다.
+     *************************************************/
+    if (
+      remainQty > 0 &&
+      remainAmt > 0 &&
+      remainPrev.qty > 0 &&
+      remainPrev.amt > 0
+    ) {
+      const qtyRatio = remainPrev.qty / remainQty;
+      const amtRatio = remainPrev.amt / remainAmt;
+      const ratio = Math.max(0, Math.min(1, qtyRatio, amtRatio));
+
+      let prevQty = Math.floor(remainQty * ratio);
+      let prevAmt = Math.round(remainAmt * ratio);
+
+      if (ratio > 0 && prevQty <= 0) prevQty = 1;
+      if (ratio > 0 && prevAmt <= 0) prevAmt = 1;
+
+      prevQty = Math.min(prevQty, remainQty, remainPrev.qty);
+      prevAmt = Math.min(prevAmt, remainAmt, remainPrev.amt);
+
+      row[prevQtyField] += prevQty;
+      row[prevAmtField] += prevAmt;
+
+      remainPrev.qty -= prevQty;
+      remainPrev.amt -= prevAmt;
+
+      remainQty -= prevQty;
+      remainAmt -= prevAmt;
+    }
+
+    /*************************************************
+     * 3. 전년재고로 못 쓴 나머지는 당해 처리
+     *************************************************/
+    if (remainQty !== 0 || remainAmt !== 0) {
+      row[curQtyField] += remainQty;
+      row[curAmtField] += remainAmt;
+    }
+  }
+
+  function reduceNegativeFromCurrentThenPrev(row, part) {
+    const totalQtyField = part === "판매" ? "판매수량" : "폐기수량";
+    const totalAmtField = part === "판매" ? "판매금액" : "폐기금액";
+
+    const prev2QtyField = part === "판매" ? "전전년_판매수량" : "전전년_폐기수량";
+    const prev2AmtField = part === "판매" ? "전전년_판매금액" : "전전년_폐기금액";
+
+    const prevQtyField = part === "판매" ? "전년_판매수량" : "전년_폐기수량";
+    const prevAmtField = part === "판매" ? "전년_판매금액" : "전년_폐기금액";
+
+    const curQtyField = part === "판매" ? "당해_판매수량" : "당해_폐기수량";
+    const curAmtField = part === "판매" ? "당해_폐기금액" : "당해_폐기금액";
+
+    const correctCurAmtField = part === "판매" ? "당해_판매금액" : "당해_폐기금액";
+
+    const totalQty = roundNumber(row[totalQtyField]);
+    const totalAmt = roundNumber(row[totalAmtField]);
+
+    let fixedQty =
+      roundNumber(row[prev2QtyField]) +
+      roundNumber(row[prevQtyField]) +
+      roundNumber(row[curQtyField]);
+
+    let fixedAmt =
+      roundNumber(row[prev2AmtField]) +
+      roundNumber(row[prevAmtField]) +
+      roundNumber(row[correctCurAmtField]);
+
+    let overQty = fixedQty - totalQty;
+    let overAmt = fixedAmt - totalAmt;
+
+    /*************************************************
+     * RAW 감소로 기존 배분값이 현재 총사용보다 큰 경우
+     * 당해에서 먼저 차감하고, 부족하면 전년에서 차감한다.
+     * 전전년은 절대 차감하지 않는다.
+     *************************************************/
+
+    if (overQty > 0) {
+      const cutCurrentQty = Math.min(overQty, Math.max(0, roundNumber(row[curQtyField])));
+      row[curQtyField] -= cutCurrentQty;
+      overQty -= cutCurrentQty;
+    }
+
+    if (overQty > 0) {
+      const cutPrevQty = Math.min(overQty, Math.max(0, roundNumber(row[prevQtyField])));
+      row[prevQtyField] -= cutPrevQty;
+      overQty -= cutPrevQty;
+    }
+
+    if (overAmt > 0) {
+      const cutCurrentAmt = Math.min(overAmt, Math.max(0, roundNumber(row[correctCurAmtField])));
+      row[correctCurAmtField] -= cutCurrentAmt;
+      overAmt -= cutCurrentAmt;
+    }
+
+    if (overAmt > 0) {
+      const cutPrevAmt = Math.min(overAmt, Math.max(0, roundNumber(row[prevAmtField])));
+      row[prevAmtField] -= cutPrevAmt;
+      overAmt -= cutPrevAmt;
+    }
+
+    /*************************************************
+     * 전년/당해에서도 흡수 불가능하면 부족수량/금액으로 표시
+     *************************************************/
+    if (overQty > 0) row.부족수량 += overQty;
+    if (overAmt > 0) row.부족금액 += overAmt;
+  }
+
+  const grouped = new Map();
+
+  rows.forEach((row) => {
+    const key = makeStockKey(row.지점명, row.품목군);
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push(row);
+  });
+
+  for (const [stockKey, groupRows] of grouped.entries()) {
+    const remainPrev = prevRemainMap.get(stockKey) || { qty: 0, amt: 0 };
+
+    groupRows.sort((a, b) => {
+      if (a.일자 !== b.일자) return a.일자.localeCompare(b.일자);
+      return 0;
+    });
+
+    groupRows.forEach((row) => {
+      allocatePositiveToPrev(row, "판매", remainPrev);
+      allocatePositiveToPrev(row, "폐기", remainPrev);
+
+      reduceNegativeFromCurrentThenPrev(row, "판매");
+      reduceNegativeFromCurrentThenPrev(row, "폐기");
+
+      finalizeDailyRow(row);
+    });
+  }
+
+  rows.forEach((row) => {
+    delete row.__hasPrev2Value;
+    delete row.__hasPrevValue;
+    delete row.__hasCurrentValue;
+  });
+
+  return sortRowsByBusinessOrder(rows).map(finalizeDailyRow);
+}
+
+
+
+/*************************************************
  * 메인 처리
  *************************************************/
 
@@ -1255,52 +1644,20 @@ function processWorkbook(workbook) {
     parseInventorySheetFixed(workbook, PREV_SHEET)
   );
 
-  /*************************************************
-   * 중요:
-   * 기존 제출 결과파일 전체를 먼저 복원한다.
-   * 이후 RAW와 기존 결과의 차이만 당해에서 증감한다.
-   *************************************************/
-  const deltaRows = buildDeltaRows(filteredRows, lockedWorkbook);
-  const anomalyIssues = validateAnomalies(deltaRows);
-
-  const mergedMap = buildLockedDailyMap(lockedWorkbook);
+  const currentDailyRows = buildCurrentDailyRows(filteredRows);
+  const anomalyIssues = validateAnomalies(currentDailyRows);
 
   /*************************************************
-   * 기존 제출파일이 없는 최초 실행인 경우:
-   * 모든 RAW를 당해로 처리한다.
+   * 핵심 변경:
+   * 기존 제출파일에서 값이 있는 연차만 고정한다.
+   * 값이 없는 전년/당해는 고정하지 않고 현재 RAW 기준으로 자동 배분한다.
    *************************************************/
-  if (!lockedWorkbook || mergedMap.size === 0) {
-    const currentDailyRows = buildCurrentDailyRows(filteredRows);
+  let mergedDailyRows = buildDailyRowsWithValueBasedLocks(
+    currentDailyRows,
+    lockedWorkbook,
+    stockMap
+  );
 
-    currentDailyRows.forEach((r) => {
-      const key = makeDailyKey(r.지점명, r.날짜, r.품목);
-      const row = createDailyCombinedRow(r.지점명, r.날짜, r.품목);
-
-      row.판매수량 = roundNumber(r.판매수량);
-      row.판매금액 = roundNumber(r.판매금액);
-      row.폐기수량 = roundNumber(r.폐기수량);
-      row.폐기금액 = roundNumber(r.폐기금액);
-
-      row.당해_판매수량 = roundNumber(r.판매수량);
-      row.당해_판매금액 = roundNumber(r.판매금액);
-      row.당해_폐기수량 = roundNumber(r.폐기수량);
-      row.당해_폐기금액 = roundNumber(r.폐기금액);
-
-      mergedMap.set(key, finalizeDailyRow(row));
-    });
-  } else {
-    addDeltaRowsAsCurrent(mergedMap, deltaRows);
-  }
-
-  let mergedDailyRows = sortRowsByBusinessOrder(Array.from(mergedMap.values())).map(finalizeDailyRow);
-
-  /*************************************************
-   * 중요 처리 순서
-   * 1. 당해 음수 발생 시 전년에서 부족분만 흡수
-   * 2. 수량/금액 짝오류 최종 정리
-   * 3. 전전년은 절대 수정하지 않음
-   *************************************************/
-  absorbCurrentNegativeWithPrevFallback(mergedDailyRows);
   repairCurrentPairErrors(mergedDailyRows);
 
   mergedDailyRows = sortRowsByBusinessOrder(mergedDailyRows).map(finalizeDailyRow);
