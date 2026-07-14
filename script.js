@@ -951,7 +951,27 @@ function repairCurrentPairErrors(dailyRows) {
  * 4. 전년금액이 부족하면 가능한 만큼만 이동한다.
  *************************************************/
 
-function raiseCurrentMinimumAmount(dailyRows, minAmount = 1000) {
+/*************************************************
+ * 당해 판매/폐기 단가 최소 보정
+ *
+ * 목적:
+ * - 당해 판매/폐기 수량 대비 금액이 너무 낮은 문제 방지
+ * - 예: 당해판매수량 70개 / 당해판매금액 65원
+ * - 기준: 당해금액은 최소 당해수량 × minUnitAmount 이상
+ *
+ * 기본값:
+ * - minUnitAmount = 1000
+ * - 즉, 1개당 최소 1,000원 기준
+ *
+ * 원칙:
+ * 1. 전전년은 절대 건드리지 않는다.
+ * 2. 전년금액을 당해금액으로 이동한다.
+ * 3. 총사용금액은 변경하지 않는다.
+ * 4. 전년금액이 부족하면 가능한 만큼만 이동한다.
+ * 5. 전년의 단가도 너무 망가지지 않게, 가능하면 전년 수량 × 최소단가는 남긴다.
+ *************************************************/
+
+function raiseCurrentMinimumUnitAmount(dailyRows, minUnitAmount = 1000) {
   function repairPart(row, part) {
     const prevQtyField = part === "판매" ? "전년_판매수량" : "전년_폐기수량";
     const prevAmtField = part === "판매" ? "전년_판매금액" : "전년_폐기금액";
@@ -966,27 +986,60 @@ function raiseCurrentMinimumAmount(dailyRows, minAmount = 1000) {
 
     /*************************************************
      * 당해 수량이 없으면 보정하지 않음
-     * 당해 금액이 0 이하이면 repairCurrentPairErrors()에서 먼저 처리
-     * 당해 금액이 이미 1,000원 이상이면 보정하지 않음
      *************************************************/
     if (curQty <= 0) return;
-    if (curAmt <= 0) return;
-    if (curAmt >= minAmount) return;
 
     /*************************************************
-     * 전년 금액이 없으면 보정 불가
+     * 당해 금액이 0 이하이면 먼저 짝오류 보정 대상
+     *************************************************/
+    if (curAmt <= 0) return;
+
+    /*************************************************
+     * 목표금액 = 당해수량 × 1개당 최소금액
+     * 예: 70개 × 1,000원 = 70,000원
+     *************************************************/
+    const targetCurAmt = curQty * minUnitAmount;
+
+    /*************************************************
+     * 이미 기준 이상이면 보정하지 않음
+     *************************************************/
+    if (curAmt >= targetCurAmt) return;
+
+    /*************************************************
+     * 전년금액이 없으면 보정 불가
      *************************************************/
     if (prevAmt <= 0) return;
 
-    const needAmt = minAmount - curAmt;
-    const moveAmt = Math.min(needAmt, prevAmt);
+    const needAmt = targetCurAmt - curAmt;
+
+    /*************************************************
+     * 전년 금액 보호 기준
+     * - 전년 수량이 남아 있다면 전년도 최소한
+     *   전년수량 × 1,000원 정도는 남기는 것을 우선한다.
+     * - 그래야 전년 단가가 갑자기 너무 망가지지 않는다.
+     *************************************************/
+    const protectedPrevAmt = prevQty > 0 ? prevQty * minUnitAmount : 0;
+
+    let movableAmt = prevAmt - protectedPrevAmt;
+
+    /*************************************************
+     * 전년 금액이 보호 기준보다 적으면
+     * 보호할 여유가 없는 상태이므로 가능한 금액만 이동한다.
+     *************************************************/
+    if (movableAmt <= 0) {
+      movableAmt = prevAmt;
+    }
+
+    const moveAmt = Math.min(needAmt, movableAmt);
+
+    if (moveAmt <= 0) return;
 
     prevAmt -= moveAmt;
     curAmt += moveAmt;
 
     /*************************************************
-     * 전년에 금액만 0이 되고 수량이 남으면 짝오류가 생길 수 있음
-     * 이 경우 전년 수량도 당해로 이동
+     * 전년에 금액이 0이 되었는데 수량만 남으면
+     * 짝오류가 생기므로 전년 수량도 당해로 이동
      *************************************************/
     if (prevQty > 0 && prevAmt <= 0) {
       curQty += prevQty;
@@ -994,8 +1047,8 @@ function raiseCurrentMinimumAmount(dailyRows, minAmount = 1000) {
     }
 
     /*************************************************
-     * 전년에 수량은 없고 금액만 남으면 짝오류가 생길 수 있음
-     * 이 경우 남은 전년 금액도 당해로 이동
+     * 전년에 수량이 없는데 금액만 남으면
+     * 짝오류가 생기므로 남은 전년금액도 당해로 이동
      *************************************************/
     if (prevAmt > 0 && prevQty <= 0) {
       curAmt += prevAmt;
@@ -1004,6 +1057,7 @@ function raiseCurrentMinimumAmount(dailyRows, minAmount = 1000) {
 
     row[prevQtyField] = Math.max(0, roundNumber(prevQty));
     row[prevAmtField] = Math.max(0, roundNumber(prevAmt));
+
     row[curQtyField] = Math.max(0, roundNumber(curQty));
     row[curAmtField] = Math.max(0, roundNumber(curAmt));
   }
@@ -1744,7 +1798,26 @@ function processWorkbook(workbook) {
    * 당해 판매/폐기 금액이 1,000원 미만이면
    * 전년금액을 당해로 이동해서 최소금액 보정
    *************************************************/
-  raiseCurrentMinimumAmount(mergedDailyRows, 1000);
+  repairCurrentPairErrors(mergedDailyRows);
+
+/*************************************************
+ * 당해 판매/폐기 금액 단가 보정
+ *
+ * 기준:
+ * - 당해 판매금액 ≥ 당해 판매수량 × 1,000원
+ * - 당해 폐기금액 ≥ 당해 폐기수량 × 1,000원
+ *
+ * 부족한 금액은 전년금액에서 당해금액으로 이동한다.
+ * 전전년은 절대 건드리지 않는다.
+ *************************************************/
+raiseCurrentMinimumUnitAmount(mergedDailyRows, 1000);
+
+/*************************************************
+ * 단가 보정 후 혹시 생길 수 있는 짝오류 재정리
+ *************************************************/
+repairCurrentPairErrors(mergedDailyRows);
+
+mergedDailyRows = sortRowsByBusinessOrder(mergedDailyRows).map(finalizeDailyRow);
   
   /*************************************************
    * 최소금액 보정 후 혹시 생길 수 있는 짝오류 재정리
